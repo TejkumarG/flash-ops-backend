@@ -138,17 +138,16 @@ async def process_team_query(request: TeamApiKeyQueryRequest) -> List[QueryRespo
 
         # Track API key usage
         try:
-            teams_collection.update_one(
-                {"_id": team_id},
+            apikeys_collection.update_one(
+                {"_id": api_key_doc["_id"]},
                 {
                     "$inc": {"usageCount": 1},
                     "$set": {
                         "lastUsedAt": datetime.utcnow(),
-                        "metadata.lastQuery": request.query[:200],
                     },
                 },
             )
-            logger.info(f"Updated usage tracking for team: {team_id}")
+            logger.info(f"Updated usage tracking for API key: {prefix}")
         except Exception as e:
             logger.warning(f"Failed to update usage tracking: {e}")
             # Don't fail the request if usage tracking fails
