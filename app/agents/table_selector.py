@@ -106,12 +106,26 @@ class TableSelector:
         all_combinations.sort(key=lambda x: x["confidence"], reverse=True)
 
         logger.info(f"[COMBINATIONS] Found {len(all_combinations)} total valid combinations")
-        for idx, combo in enumerate(all_combinations[:5]):  # Log top 5
+
+        # Filter out duplicate table sets (keep only unique combinations)
+        unique_combinations = []
+        seen_table_sets = set()
+
+        for combo in all_combinations:
+            # Create a frozenset of table names (order-independent)
+            table_set = frozenset([t.get('table_name') for t in combo['selected_tables']])
+
+            if table_set not in seen_table_sets:
+                unique_combinations.append(combo)
+                seen_table_sets.add(table_set)
+
+        logger.info(f"[UNIQUE COMBINATIONS] Filtered to {len(unique_combinations)} unique table sets")
+        for idx, combo in enumerate(unique_combinations[:5]):  # Log top 5
             tables_str = ', '.join([t.get('table_name', 'unknown') for t in combo['selected_tables']])
             logger.info(f"  #{idx+1}: {tables_str} (tier={combo['tier']}, score={combo['confidence']:.3f}, pattern={combo['join_pattern']})")
 
         # Return best as primary + next 2 as alternatives
-        if len(all_combinations) == 0:
+        if len(unique_combinations) == 0:
             # Fallback: Use best single table
             logger.warning("[DECISION] No valid combinations found, using fallback")
             enriched_table = self._enrich_table_with_metadata(cluster_representatives[0])
@@ -126,11 +140,11 @@ class TableSelector:
             }
 
         # Primary selection
-        primary = all_combinations[0]
+        primary = unique_combinations[0]
         logger.info(f"[PRIMARY SELECTION] {[t.get('table_name') for t in primary['selected_tables']]} (score: {primary['confidence']:.3f})")
 
-        # Alternative selections (next 2 best)
-        alternatives = all_combinations[1:3]  # Get next 2
+        # Alternative selections (next 2 best unique combinations)
+        alternatives = unique_combinations[1:3]  # Get next 2
         logger.info(f"[ALTERNATIVES] Found {len(alternatives)} alternative combinations")
 
         primary["alternatives"] = alternatives
