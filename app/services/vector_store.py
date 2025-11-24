@@ -107,7 +107,7 @@ class MilvusVectorStore:
         self._load_model()
         self.encoder = self.model
 
-    def build_index(self, tables: List[Dict[str, Any]], database_id: str) -> Tuple[str, int]:
+    def build_index(self, tables: List[Dict[str, Any]], database_id: str, delete_existing: bool = True) -> Tuple[str, int]:
         """
         Build Milvus collection from tables with batching support.
         Only updates embeddings for the specific database_id (preserves other databases).
@@ -115,6 +115,7 @@ class MilvusVectorStore:
         Args:
             tables: List of table metadata
             database_id: MongoDB database ID to associate with tables
+            delete_existing: Whether to delete existing embeddings for this database_id (default: True)
 
         Returns:
             Tuple of (collection_name, num_vectors)
@@ -130,13 +131,14 @@ class MilvusVectorStore:
             collection_exists = utility.has_collection(self.collection_name)
 
             if collection_exists:
-                # Collection exists - delete only this database's embeddings
+                # Collection exists
                 self.collection = Collection(self.collection_name)
 
-                # Delete existing embeddings for this database_id
-                expr = f'database_id == "{database_id}"'
-                self.collection.delete(expr)
-                logger.info(f"Deleted existing embeddings for database_id: {database_id}")
+                # Delete existing embeddings for this database_id (only if requested)
+                if delete_existing:
+                    expr = f'database_id == "{database_id}"'
+                    self.collection.delete(expr)
+                    logger.info(f"Deleted existing embeddings for database_id: {database_id}")
             else:
                 # Create new collection
                 fields = [

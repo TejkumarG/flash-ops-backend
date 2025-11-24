@@ -107,14 +107,12 @@ class MongoDBClient:
                 "password": connection_doc.get("password"),  # Encrypted
             }
 
-            # Extract schemas using SchemaExtractor
+            # Extract schemas using SchemaExtractor (streaming generator)
             logger.info(f"Connecting to {connection_config['connectionType']} database to extract schemas")
             extractor = SchemaExtractor(connection_config)
-            tables = extractor.extract_schemas(database_name)
 
-            logger.info(f"Extracted {len(tables)} tables from database '{database_name}'")
-
-            return tables
+            # Return generator for streaming processing
+            return extractor.extract_schemas(database_name)
 
         except Exception as e:
             logger.error(f"Error fetching tables: {e}")

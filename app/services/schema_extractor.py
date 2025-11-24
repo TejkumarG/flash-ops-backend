@@ -90,23 +90,213 @@ class SchemaExtractor:
 
             logger.info(f"Found {len(tables)} tables in database '{database_name}'")
 
-            # Extract schema for each table
-            table_schemas = []
-            for table_row in tables:
-                table_name = table_row['TABLE_NAME']
-                table_schema = self._get_table_schema(cursor, table_name)
-                table_schemas.append(table_schema)
+            # Extract schema in batches and yield immediately (streaming, no memory accumulation)
+            batch_size = 1000  # Process 1000 tables at a time
+            total_tables = len(tables)
+            total_extracted = 0
+
+            for i in range(0, total_tables, batch_size):
+                batch_end = min(i + batch_size, total_tables)
+                batch_tables = tables[i:batch_end]
+                batch_table_names = [t['TABLE_NAME'] for t in batch_tables]
+
+                logger.info(f"Processing tables {i+1}-{batch_end} of {total_tables} ({int((batch_end/total_tables)*100)}%)")
+
+                try:
+                    # Use optimized batch schema extraction (4 queries instead of N*4)
+                    batch_schemas = self._get_batch_table_schemas(cursor, batch_table_names)
+                    total_extracted += len(batch_schemas)
+                    logger.info(f"Batch complete: {len(batch_schemas)} tables extracted (total: {total_extracted}/{total_tables})")
+
+                    # Yield batch immediately for processing (streaming)
+                    yield batch_schemas
+
+                except Exception as e:
+                    logger.warning(f"Batch query failed, falling back to individual queries: {e}")
+                    # Fallback to individual queries if batch fails
+                    fallback_schemas = []
+                    for table_row in batch_tables:
+                        table_name = table_row['TABLE_NAME']
+                        try:
+                            table_schema = self._get_table_schema(cursor, table_name)
+                            fallback_schemas.append(table_schema)
+                        except Exception as e:
+                            logger.warning(f"Failed to extract schema for table '{table_name}': {e}")
+                            continue
+
+                    total_extracted += len(fallback_schemas)
+                    logger.info(f"Batch complete (fallback): {len(fallback_schemas)} tables extracted (total: {total_extracted}/{total_tables})")
+                    yield fallback_schemas
+
+            logger.info(f"Schema extraction complete: {total_extracted}/{total_tables} tables extracted successfully")
 
             cursor.close()
             self.connection.close()
-
-            return table_schemas
 
         except Exception as e:
             logger.error(f"Error extracting MSSQL schemas: {e}")
             if self.connection:
                 self.connection.close()
             raise
+
+    def _get_batch_table_schemas(self, cursor, table_names: List[str]) -> List[Dict[str, Any]]:
+        """
+        Get detailed schemas for multiple tables in batch (optimized).
+
+        Args:
+            cursor: Database cursor
+            table_names: List of table names to fetch
+
+        Returns:
+            List of table metadata dictionaries
+        """
+        if not table_names:
+            return []
+
+        # Create SQL IN clause with placeholders
+        placeholders = ','.join(['%s'] * len(table_names))
+
+        # 1. Get all columns for all tables in batch (1 query instead of N)
+        columns_query = f"""
+            SELECT
+                TABLE_NAME,
+                COLUMN_NAME,
+                DATA_TYPE,
+                IS_NULLABLE,
+                CHARACTER_MAXIMUM_LENGTH,
+                COLUMN_DEFAULT,
+                ORDINAL_POSITION
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME IN ({placeholders})
+            ORDER BY TABLE_NAME, ORDINAL_POSITION
+        """
+        cursor.execute(columns_query, tuple(table_names))
+        column_rows = cursor.fetchall()
+
+        # Group columns by table
+        columns_by_table = {}
+        for row in column_rows:
+            table_name = row[0]
+            if table_name not in columns_by_table:
+                columns_by_table[table_name] = []
+            columns_by_table[table_name].append({
+                'COLUMN_NAME': row[1],
+                'DATA_TYPE': row[2],
+                'IS_NULLABLE': row[3],
+                'CHARACTER_MAXIMUM_LENGTH': row[4],
+                'COLUMN_DEFAULT': row[5],
+                'ORDINAL_POSITION': row[6]
+            })
+
+        # 2. Get all primary keys in batch (1 query instead of N)
+        pk_query = f"""
+            SELECT
+                t.TABLE_NAME,
+                COLUMN_NAME
+            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+            INNER JOIN INFORMATION_SCHEMA.TABLES t ON t.TABLE_NAME = kcu.TABLE_NAME
+            WHERE OBJECTPROPERTY(OBJECT_ID(kcu.CONSTRAINT_SCHEMA + '.' + kcu.CONSTRAINT_NAME), 'IsPrimaryKey') = 1
+            AND t.TABLE_NAME IN ({placeholders})
+        """
+        cursor.execute(pk_query, tuple(table_names))
+        pk_rows = cursor.fetchall()
+
+        # Group PKs by table
+        pk_by_table = {}
+        for row in pk_rows:
+            table_name = row[0]
+            if table_name not in pk_by_table:
+                pk_by_table[table_name] = set()
+            pk_by_table[table_name].add(row[1])
+
+        # 3. Get all foreign keys in batch (1 query instead of N)
+        fk_query = f"""
+            SELECT
+                OBJECT_NAME(fc.parent_object_id) AS TABLE_NAME,
+                COL_NAME(fc.parent_object_id, fc.parent_column_id) AS COLUMN_NAME,
+                OBJECT_NAME(fc.referenced_object_id) AS REFERENCED_TABLE,
+                COL_NAME(fc.referenced_object_id, fc.referenced_column_id) AS REFERENCED_COLUMN
+            FROM sys.foreign_key_columns AS fc
+            INNER JOIN sys.foreign_keys AS f ON f.object_id = fc.constraint_object_id
+            WHERE OBJECT_NAME(fc.parent_object_id) IN ({placeholders})
+        """
+        cursor.execute(fk_query, tuple(table_names))
+        fk_rows = cursor.fetchall()
+
+        # Group FKs by table
+        fk_by_table = {}
+        for row in fk_rows:
+            table_name = row[0]
+            column_name = row[1]
+            if table_name not in fk_by_table:
+                fk_by_table[table_name] = {}
+            fk_by_table[table_name][column_name] = {
+                'table': row[2],
+                'column': row[3]
+            }
+
+        # 4. Get row counts for all tables in batch (1 query instead of N)
+        count_query = f"""
+            SELECT
+                o.name AS TABLE_NAME,
+                SUM(p.rows) AS row_count
+            FROM sys.partitions p
+            INNER JOIN sys.objects o ON p.object_id = o.object_id
+            WHERE o.name IN ({placeholders})
+            AND p.index_id IN (0, 1)
+            GROUP BY o.name
+        """
+        cursor.execute(count_query, tuple(table_names))
+        count_rows = cursor.fetchall()
+
+        # Map row counts
+        row_count_by_table = {}
+        for row in count_rows:
+            row_count_by_table[row[0]] = row[1] if row[1] else 0
+
+        # Build table metadata for each table
+        table_schemas = []
+        for table_name in table_names:
+            columns_data = columns_by_table.get(table_name, [])
+            pk_columns = pk_by_table.get(table_name, set())
+            fk_map = fk_by_table.get(table_name, {})
+            row_count = row_count_by_table.get(table_name, 0)
+
+            # Format columns
+            columns = []
+            for col in columns_data:
+                column_info = {
+                    'name': col['COLUMN_NAME'],
+                    'type': col['DATA_TYPE'].upper(),
+                    'nullable': col['IS_NULLABLE'] == 'YES',
+                    'is_primary_key': col['COLUMN_NAME'] in pk_columns
+                }
+
+                if col['COLUMN_NAME'] in fk_map:
+                    column_info['is_foreign_key'] = True
+                    fk_ref = fk_map[col['COLUMN_NAME']]
+                    column_info['references'] = f"{fk_ref['table']}.{fk_ref['column']}"
+
+                if col['CHARACTER_MAXIMUM_LENGTH']:
+                    column_info['max_length'] = col['CHARACTER_MAXIMUM_LENGTH']
+
+                if col['COLUMN_DEFAULT']:
+                    column_info['default'] = col['COLUMN_DEFAULT']
+
+                columns.append(column_info)
+
+            # Build table metadata
+            table_metadata = {
+                'table_name': table_name,
+                'name': table_name,
+                'row_count': row_count,
+                'columns': columns
+            }
+
+            table_schemas.append(table_metadata)
+
+        logger.info(f"Batch extracted schemas for {len(table_schemas)} tables with 4 queries (optimized)")
+        return table_schemas
 
     def _get_table_schema(self, cursor, table_name: str) -> Dict[str, Any]:
         """

@@ -57,11 +57,42 @@ class EmbeddingPipeline:
                     processing_time_ms=int((time.time() - start_time) * 1000)
                 )
 
-            # Fetch tables from MongoDB
-            logger.info("Fetching tables from MongoDB...")
-            tables = self.mongo_client.fetch_tables_for_database(db_id)
+            # Fetch tables from MongoDB (streaming generator)
+            logger.info("Fetching tables from MongoDB (streaming)...")
+            tables_generator = self.mongo_client.fetch_tables_for_database(db_id)
 
-            if not tables:
+            # Process each batch as it arrives (no memory accumulation)
+            total_tables_processed = 0
+            total_vectors_created = 0
+            chunk_num = 0
+
+            for chunk in tables_generator:
+                chunk_num += 1
+                chunk_size = len(chunk)
+
+                logger.info(f"Processing chunk {chunk_num}: {chunk_size} tables")
+
+                try:
+                    # Build index for this chunk only (delete existing on first chunk)
+                    is_first_chunk = (chunk_num == 1)
+                    collection_name, num_vectors = self.vector_store.build_index(
+                        chunk,
+                        db_id,
+                        delete_existing=is_first_chunk
+                    )
+
+                    total_tables_processed += chunk_size
+                    total_vectors_created += num_vectors
+
+                    logger.info(f"Chunk {chunk_num} complete: {chunk_size} tables, {num_vectors} vectors (total: {total_tables_processed} tables, {total_vectors_created} vectors)")
+
+                except Exception as e:
+                    logger.error(f"Chunk {chunk_num} failed: {e}", exc_info=True)
+                    logger.warning(f"Skipping chunk {chunk_num} and continuing with next chunk...")
+                    # Continue processing remaining chunks even if this one failed
+                    continue
+
+            if total_tables_processed == 0:
                 logger.error(f"No tables found for database {db_id}")
                 return EmbeddingGenerationResponse(
                     status="error",
@@ -73,24 +104,20 @@ class EmbeddingPipeline:
                     processing_time_ms=int((time.time() - start_time) * 1000)
                 )
 
-            logger.info(f"Fetched {len(tables)} tables from MongoDB")
-
-            # Build Milvus collection
-            logger.info("Building Milvus collection...")
-            collection_name, num_vectors = self.vector_store.build_index(tables, db_id)
+            logger.info(f"All chunks processed: {total_tables_processed} tables, {total_vectors_created} vectors")
 
             processing_time = int((time.time() - start_time) * 1000)
 
             logger.info(
                 f"Embeddings generated successfully in {processing_time}ms: "
-                f"{len(tables)} tables processed"
+                f"{total_tables_processed} tables processed"
             )
 
             return EmbeddingGenerationResponse(
                 status="success",
                 message="Embeddings generated successfully",
-                tables_processed=len(tables),
-                embeddings_created=num_vectors,
+                tables_processed=total_tables_processed,
+                embeddings_created=total_vectors_created,
                 index_path=f"milvus://{collection_name}",
                 metadata_path=f"milvus://{collection_name}",
                 processing_time_ms=processing_time
