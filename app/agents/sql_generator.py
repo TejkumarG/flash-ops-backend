@@ -83,6 +83,8 @@ class SQLGenerator:
         """Get system prompt for SQL generation."""
         return """You are an expert SQL developer. Generate Microsoft SQL Server (T-SQL) queries based on the provided schema and natural language question.
 
+You may receive multiple table combination options. Analyze each option and choose the BEST one for the query.
+
 Rules:
 - Return ONLY the SQL query, no explanations
 - Use T-SQL/MSSQL syntax (SELECT TOP N instead of LIMIT, etc.)
@@ -90,7 +92,9 @@ Rules:
 - Refer to the provided schema for exact column names and types
 - Handle date filters appropriately
 - Use proper JOINs as specified in the schema
-- Generate efficient, readable SQL"""
+- Generate efficient, readable SQL
+- If multiple options are provided, choose the one that best answers the query
+- On retry attempts, try a DIFFERENT option than before"""
 
     def _build_user_prompt(
         self,
@@ -102,10 +106,16 @@ Rules:
 
         if previous_errors:
             parts.append("\n" + "=" * 60)
-            parts.append("PREVIOUS ERRORS (avoid these):")
+            parts.append("PREVIOUS ATTEMPT FAILED - TRY A DIFFERENT OPTION")
             parts.append("=" * 60)
+            parts.append("")
+            parts.append("Previous errors:")
             for idx, error in enumerate(previous_errors, 1):
-                parts.append(f"{idx}. {error}")
+                parts.append(f"  {idx}. {error}")
+            parts.append("")
+            parts.append("IMPORTANT: The previous combination didn't work.")
+            parts.append("Choose a DIFFERENT option from the ones listed above.")
+            parts.append("Analyze which option is more likely to succeed based on the error.")
             parts.append("")
 
         parts.append("Generate SQL:")
