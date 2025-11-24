@@ -200,6 +200,18 @@ class MilvusVectorStore:
                         if col_types:
                             text_parts.append(f"Schema: {', '.join(col_types[:10])}")  # Limit to 10 to avoid token limit
 
+                        # Add column descriptions if available (for better semantic search)
+                        col_descriptions = []
+                        for col in table['columns']:
+                            col_name = col.get('name', '')
+                            col_desc = col.get('description', '')
+                            if col_name and col_desc:
+                                # Truncate long descriptions to avoid token limits
+                                desc_truncated = col_desc[:200] if len(col_desc) > 200 else col_desc
+                                col_descriptions.append(f"{col_name}: {desc_truncated}")
+                        if col_descriptions:
+                            text_parts.append(f"Column Descriptions: {'; '.join(col_descriptions[:10])}")  # Limit to 10
+
                     text = "\n".join(text_parts)
                     texts.append(text)
 

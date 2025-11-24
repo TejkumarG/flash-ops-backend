@@ -254,6 +254,35 @@ class SchemaExtractor:
         for row in count_rows:
             row_count_by_table[row[0]] = row[1] if row[1] else 0
 
+        # 5. Get column descriptions for all tables in batch (1 query instead of N)
+        desc_query = f"""
+            SELECT
+                t.name AS table_name,
+                c.name AS column_name,
+                CAST(ep.value AS NVARCHAR(MAX)) AS description
+            FROM sys.tables t
+            INNER JOIN sys.columns c ON c.object_id = t.object_id
+            LEFT JOIN sys.extended_properties ep
+                ON ep.major_id = t.object_id
+                AND ep.minor_id = c.column_id
+                AND ep.name = 'MS_Description'
+            WHERE t.name IN ({placeholders})
+            AND ep.value IS NOT NULL
+            ORDER BY t.name, c.column_id
+        """
+        cursor.execute(desc_query, tuple(table_names))
+        desc_rows = cursor.fetchall()
+
+        # Map column descriptions
+        desc_by_table = {}
+        for row in desc_rows:
+            table_name = row[0]
+            column_name = row[1]
+            description = row[2]
+            if table_name not in desc_by_table:
+                desc_by_table[table_name] = {}
+            desc_by_table[table_name][column_name] = description
+
         # Build table metadata for each table
         table_schemas = []
         for table_name in table_names:
@@ -261,6 +290,7 @@ class SchemaExtractor:
             pk_columns = pk_by_table.get(table_name, set())
             fk_map = fk_by_table.get(table_name, {})
             row_count = row_count_by_table.get(table_name, 0)
+            desc_map = desc_by_table.get(table_name, {})
 
             # Format columns
             columns = []
@@ -283,6 +313,10 @@ class SchemaExtractor:
                 if col['COLUMN_DEFAULT']:
                     column_info['default'] = col['COLUMN_DEFAULT']
 
+                # Add column description if available
+                if col['COLUMN_NAME'] in desc_map:
+                    column_info['description'] = desc_map[col['COLUMN_NAME']]
+
                 columns.append(column_info)
 
             # Build table metadata
@@ -295,7 +329,7 @@ class SchemaExtractor:
 
             table_schemas.append(table_metadata)
 
-        logger.info(f"Batch extracted schemas for {len(table_schemas)} tables with 4 queries (optimized)")
+        logger.info(f"Batch extracted schemas for {len(table_schemas)} tables with 5 queries (optimized)")
         return table_schemas
 
     def _get_table_schema(self, cursor, table_name: str) -> Dict[str, Any]:
