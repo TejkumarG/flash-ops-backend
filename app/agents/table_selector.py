@@ -37,6 +37,7 @@ class TableSelector:
     ) -> Dict[str, Any]:
         """
         Select best combination of 1, 2, or 3 tables using range-based scoring.
+        Returns top 3 combinations as alternatives.
 
         Args:
             cluster_representatives: List of representative tables from clustering
@@ -50,7 +51,18 @@ class TableSelector:
                 "joins": [{"from": ..., "to": ..., "condition": ..., "type": ...}],
                 "join_pattern": str ("single", "pair", "star"),
                 "confidence": float,
-                "reasoning": str
+                "reasoning": str,
+                "alternatives": [
+                    {
+                        "selected_tables": [...],
+                        "tier": int,
+                        "joins": [...],
+                        "join_pattern": str,
+                        "confidence": float,
+                        "reasoning": str
+                    },
+                    ...
+                ]  # Top 2 additional combinations
             }
         """
         logger.info(f"Selecting tables from {len(cluster_representatives)} candidates")
@@ -67,9 +79,41 @@ class TableSelector:
         logger.info(f"[TABLE SELECTION] 2nd table: {cluster_representatives[1].get('table_name') if len(cluster_representatives) > 1 else 'N/A'} (score: {second_score:.3f})")
         logger.info(f"[TABLE SELECTION] Score gap: {score_gap:.3f}")
 
-        # Strategy 1: Very high single-table confidence (≥0.85) - use immediately
-        if top_score >= 0.85:
-            logger.info(f"[DECISION] Single table selected: Very high confidence {top_score:.3f} ≥ 0.85")
+        # Collect ALL valid combinations from different strategies
+        all_combinations = []
+
+        # Strategy 1: Single-table combinations (top 3 tables)
+        for idx, table in enumerate(cluster_representatives[:3]):
+            enriched_table = self._enrich_table_with_metadata(table)
+            all_combinations.append({
+                "selected_tables": [enriched_table],
+                "tier": 1,
+                "joins": [],
+                "join_pattern": "single",
+                "confidence": table.get("score", 0),
+                "reasoning": f"Single table (rank #{idx+1}, score: {table.get('score', 0):.3f})"
+            })
+
+        # Strategy 2: 2-table combinations (collect all valid ones)
+        two_table_results = self._try_two_tables_all(cluster_representatives)
+        all_combinations.extend(two_table_results)
+
+        # Strategy 3: 3-table combinations (collect all valid ones)
+        three_table_results = self._try_three_tables_all(cluster_representatives)
+        all_combinations.extend(three_table_results)
+
+        # Sort all combinations by confidence score
+        all_combinations.sort(key=lambda x: x["confidence"], reverse=True)
+
+        logger.info(f"[COMBINATIONS] Found {len(all_combinations)} total valid combinations")
+        for idx, combo in enumerate(all_combinations[:5]):  # Log top 5
+            tables_str = ', '.join([t.get('table_name', 'unknown') for t in combo['selected_tables']])
+            logger.info(f"  #{idx+1}: {tables_str} (tier={combo['tier']}, score={combo['confidence']:.3f}, pattern={combo['join_pattern']})")
+
+        # Return best as primary + next 2 as alternatives
+        if len(all_combinations) == 0:
+            # Fallback: Use best single table
+            logger.warning("[DECISION] No valid combinations found, using fallback")
             enriched_table = self._enrich_table_with_metadata(cluster_representatives[0])
             return {
                 "selected_tables": [enriched_table],
@@ -77,54 +121,20 @@ class TableSelector:
                 "joins": [],
                 "join_pattern": "single",
                 "confidence": top_score,
-                "reasoning": f"Very high single-table confidence ({top_score:.3f})"
+                "reasoning": "Fallback to highest-scoring table",
+                "alternatives": []
             }
 
-        # Strategy 2: Try 2-table combinations and compare with single-table
-        two_table_result = self._try_two_tables(cluster_representatives)
+        # Primary selection
+        primary = all_combinations[0]
+        logger.info(f"[PRIMARY SELECTION] {[t.get('table_name') for t in primary['selected_tables']]} (score: {primary['confidence']:.3f})")
 
-        if two_table_result:
-            two_table_score = two_table_result["confidence"]
-            logger.info(f"[TABLE SELECTION] 2-table score: {two_table_score:.3f}")
+        # Alternative selections (next 2 best)
+        alternatives = all_combinations[1:3]  # Get next 2
+        logger.info(f"[ALTERNATIVES] Found {len(alternatives)} alternative combinations")
 
-            # If 2-table score is very high (≥0.90), use it
-            if two_table_score >= 0.90:
-                logger.info(f"[DECISION] 2-table selected: Very high 2-table confidence {two_table_score:.3f} ≥ 0.90")
-                return two_table_result
-
-            # If single table has huge margin (≥0.2) and decent score (≥0.70), prefer single
-            if score_gap >= 0.2 and top_score >= 0.70:
-                logger.info(f"[DECISION] Single table selected: Large gap {score_gap:.3f} with decent score {top_score:.3f}")
-                enriched_table = self._enrich_table_with_metadata(cluster_representatives[0])
-                return {
-                    "selected_tables": [enriched_table],
-                    "tier": 1,
-                    "joins": [],
-                    "join_pattern": "single",
-                    "confidence": top_score,
-                    "reasoning": f"Large score gap ({score_gap:.3f}) with decent confidence ({top_score:.3f})"
-                }
-
-            # Otherwise, use 2-table result
-            logger.info(f"[DECISION] 2-table selected: 2-table score {two_table_score:.3f} better than single {top_score:.3f}")
-            return two_table_result
-
-        # Try 3-table combinations
-        three_table_result = self._try_three_tables(cluster_representatives)
-        if three_table_result:
-            return three_table_result
-
-        # Fallback: Use best single table
-        logger.warning("[DECISION] Fallback to single table - no valid multi-table combination")
-        enriched_table = self._enrich_table_with_metadata(cluster_representatives[0])
-        return {
-            "selected_tables": [enriched_table],
-            "tier": 1,
-            "joins": [],
-            "join_pattern": "single",
-            "confidence": top_score,
-            "reasoning": "Fallback to highest-scoring table"
-        }
+        primary["alternatives"] = alternatives
+        return primary
 
     def _try_single_table(
         self,
@@ -315,6 +325,136 @@ class TableSelector:
             "confidence": best["score"],
             "reasoning": f"Best 3-table star schema with {best['center']} at center"
         }
+
+    def _try_two_tables_all(
+        self,
+        tables: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Try all 2-table combinations and return all valid ones.
+
+        Args:
+            tables: List of candidate tables
+
+        Returns:
+            List of all valid 2-table combinations (sorted by score)
+        """
+        if len(tables) < 2:
+            return []
+
+        logger.info("Collecting all 2-table combinations...")
+
+        valid_combinations = []
+
+        # Try all pairs
+        for table1, table2 in combinations(tables[:10], 2):  # Limit to top 10
+            # Check if joinable
+            join_info = self._find_join(
+                table1["table_name"],
+                table2["table_name"],
+                self._current_database_id
+            )
+
+            if join_info:
+                # Calculate score
+                score = self._score_combination([table1, table2], [join_info])
+
+                # Enrich tables with metadata
+                enriched_tables = [
+                    self._enrich_table_with_metadata(table1),
+                    self._enrich_table_with_metadata(table2)
+                ]
+
+                valid_combinations.append({
+                    "selected_tables": enriched_tables,
+                    "tier": 2,
+                    "joins": [join_info],
+                    "join_pattern": "pair",
+                    "confidence": score,
+                    "reasoning": f"2-table join: {table1['table_name']} + {table2['table_name']}"
+                })
+
+        logger.info(f"Found {len(valid_combinations)} valid 2-table combinations")
+
+        # Sort by score
+        valid_combinations.sort(key=lambda x: x["confidence"], reverse=True)
+
+        return valid_combinations
+
+    def _try_three_tables_all(
+        self,
+        tables: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Try all 3-table combinations (star schema) and return all valid ones.
+
+        Args:
+            tables: List of candidate tables
+
+        Returns:
+            List of all valid 3-table combinations (sorted by score)
+        """
+        if len(tables) < 3:
+            return []
+
+        logger.info("Collecting all 3-table combinations (star schema)...")
+
+        valid_combinations = []
+
+        # Try each table as star center
+        for center_idx in range(min(5, len(tables))):  # Top 5 as potential centers
+            center = tables[center_idx]
+
+            # Find tables that join to center
+            joinable = []
+            for other in tables:
+                if other == center:
+                    continue
+
+                join_info = self._find_join(
+                    center["table_name"],
+                    other["table_name"],
+                    self._current_database_id
+                )
+                if join_info:
+                    joinable.append({"table": other, "join": join_info})
+
+            # Need at least 2 tables to join with center
+            if len(joinable) >= 2:
+                # Sort by score
+                joinable.sort(key=lambda x: x["table"].get("score", 0), reverse=True)
+
+                # Try multiple combinations of support tables (not just top 2)
+                for i in range(len(joinable) - 1):
+                    for j in range(i + 1, min(i + 3, len(joinable))):  # Try top 3 pairs
+                        support1 = joinable[i]
+                        support2 = joinable[j]
+
+                        # Create 3-table star combination
+                        selected_tables = [center, support1["table"], support2["table"]]
+                        joins = [support1["join"], support2["join"]]
+
+                        score = self._score_combination(selected_tables, joins)
+                        score += 0.1  # Star schema bonus
+
+                        # Enrich tables with metadata
+                        enriched_tables = [self._enrich_table_with_metadata(t) for t in selected_tables]
+
+                        valid_combinations.append({
+                            "selected_tables": enriched_tables,
+                            "tier": 3,
+                            "joins": joins,
+                            "join_pattern": "star",
+                            "confidence": score,
+                            "reasoning": f"3-table star: {center['table_name']} (center) + 2 support tables"
+                        })
+
+        logger.info(f"Found {len(valid_combinations)} valid 3-table combinations")
+
+        # Sort by score
+        valid_combinations.sort(key=lambda x: x["confidence"], reverse=True)
+
+        return valid_combinations
 
     def _enrich_table_with_metadata(self, table: Dict[str, Any]) -> Dict[str, Any]:
         """

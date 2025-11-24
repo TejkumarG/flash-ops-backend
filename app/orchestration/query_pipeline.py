@@ -72,37 +72,80 @@ class QueryPipeline:
             clusters = self.table_clustering.cluster_tables(top_tables)
             cluster_representatives = self.table_clustering.get_cluster_representatives(clusters)
 
-            # Stage 3: Table Selection
+            # Stage 3: Table Selection (with alternatives)
             logger.info("Stage 3: Table Selection")
             selection = self.table_selector.select_tables(cluster_representatives, database_id)
 
-            # Stage 4: Schema Packaging
-            logger.info("Stage 4: Schema Packaging")
-            schema_package = self.schema_packager.package_schemas(selection, query)
+            # Collect all combinations to try (primary + alternatives)
+            combinations_to_try = [selection]  # Primary selection
+            if "alternatives" in selection and selection["alternatives"]:
+                combinations_to_try.extend(selection["alternatives"])
 
-            # Stage 5: SQL Generation (with reflection)
-            logger.info("Stage 5: SQL Generation")
-            sql, errors = self._generate_sql_with_reflection(schema_package, database_id)
+            logger.info(f"[MULTI-COMBINATION] Will try {len(combinations_to_try)} table combinations")
 
-            if not sql:
+            # Try each combination until we get a successful result
+            successful_result = None
+            all_errors = []
+
+            for combo_idx, combo_selection in enumerate(combinations_to_try, 1):
+                combo_tables = ', '.join([t.get('table_name', 'unknown') for t in combo_selection['selected_tables']])
+                logger.info(f"[COMBINATION {combo_idx}/{len(combinations_to_try)}] Trying: {combo_tables} (confidence: {combo_selection['confidence']:.3f})")
+
+                try:
+                    # Stage 4: Schema Packaging for this combination
+                    logger.info(f"Stage 4: Schema Packaging (combination {combo_idx})")
+                    schema_package = self.schema_packager.package_schemas(combo_selection, query)
+
+                    # Stage 5: SQL Generation (with reflection)
+                    logger.info(f"Stage 5: SQL Generation (combination {combo_idx})")
+                    sql, errors = self._generate_sql_with_reflection(schema_package, database_id)
+
+                    if not sql:
+                        logger.warning(f"[COMBINATION {combo_idx}] SQL generation failed: {errors}")
+                        all_errors.append(f"Combination {combo_idx} ({combo_tables}): {', '.join(errors)}")
+                        continue
+
+                    # Stage 6 & 7: Validation and Execution
+                    logger.info(f"Stage 6-7: Validation and Execution (combination {combo_idx})")
+                    is_valid, error_msg, results, row_count = self.quality_inspector.validate_and_execute(sql, database_id)
+
+                    if not is_valid:
+                        logger.warning(f"[COMBINATION {combo_idx}] Execution failed: {error_msg}")
+                        all_errors.append(f"Combination {combo_idx} ({combo_tables}): {error_msg}")
+                        continue
+
+                    # Success! Store this result
+                    logger.info(f"[COMBINATION {combo_idx}] SUCCESS! Generated valid SQL with {row_count} rows")
+                    successful_result = {
+                        "selection": combo_selection,
+                        "sql": sql,
+                        "results": results,
+                        "row_count": row_count,
+                        "combination_rank": combo_idx
+                    }
+                    break  # Stop trying other combinations
+
+                except Exception as e:
+                    logger.error(f"[COMBINATION {combo_idx}] Error: {e}")
+                    all_errors.append(f"Combination {combo_idx} ({combo_tables}): {str(e)}")
+                    continue
+
+            # Check if any combination succeeded
+            if not successful_result:
                 return self._error_response(
                     query,
-                    f"Failed to generate valid SQL after {settings.MAX_REFLECTION_ATTEMPTS} attempts",
-                    [f"Errors: {', '.join(errors)}"],
+                    f"Failed to generate valid SQL for all {len(combinations_to_try)} table combinations",
+                    all_errors,
                     int((time.time() - start_time) * 1000)
                 )
 
-            # Stage 6 & 7: Validation and Execution
-            logger.info("Stage 6-7: Validation and Execution")
-            is_valid, error_msg, results, row_count = self.quality_inspector.validate_and_execute(sql, database_id)
+            # Use the successful result
+            selection = successful_result["selection"]
+            sql = successful_result["sql"]
+            results = successful_result["results"]
+            row_count = successful_result["row_count"]
 
-            if not is_valid:
-                return self._error_response(
-                    query,
-                    f"SQL validation/execution failed: {error_msg}",
-                    ["Check table names and column names", "Verify query semantics"],
-                    int((time.time() - start_time) * 1000)
-                )
+            logger.info(f"[FINAL RESULT] Using combination #{successful_result['combination_rank']}: {[t['table_name'] for t in selection['selected_tables']]}")
 
             # Format results with LLM summary
             tables_used = [t["table_name"] for t in selection["selected_tables"]]
