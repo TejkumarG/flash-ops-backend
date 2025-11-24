@@ -1,6 +1,7 @@
 version: '3.8'
 
 services:
+  # etcd for Milvus
   etcd:
     container_name: milvus-etcd
     image: quay.io/coreos/etcd:v3.5.5
@@ -77,6 +78,39 @@ services:
       - milvus
     networks:
       - flash-ops-network
+
+  # FastAPI Application
+  fastapi:
+    container_name: flash-ops-api
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # MongoDB - Uses external/host MongoDB (configure in .env)
+      # For host MongoDB: mongodb://host.docker.internal:27017
+      # For Docker MongoDB on host: mongodb://localhost:27017
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_SECURE=false
+    env_file:
+      - ../.env
+    volumes:
+      - ../data:/app/data
+    depends_on:
+      milvus:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - flash-ops-network
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   etcd-data:

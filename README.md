@@ -4,12 +4,13 @@ Production-ready NL2SQL system supporting **1 crore (10 million) tables** with i
 
 ## 🚀 Features
 
-- ✅ **Massive Scale**: Handles 1 crore tables using FAISS vector search
+- ✅ **Massive Scale**: Handles 1 crore tables using Milvus vector search
 - ✅ **Intelligent Table Selection**: Clustering-based approach avoids redundant tables
 - ✅ **Flexible Joins**: FK + column matching + pattern inference
 - ✅ **Guaranteed Response**: 100% response rate with fallback chains
 - ✅ **Clean Architecture**: PyTorch-style orchestration with modular agents
-- ✅ **Docker Support**: Full containerization with visualization
+- ✅ **Docker Support**: Full containerization - one command to run everything
+- ✅ **Non-Programmer Friendly**: Simple setup, no complex configuration needed
 
 ## 📋 Architecture
 
@@ -82,74 +83,112 @@ flash-ops/
 └── requirements.txt
 ```
 
-## 🚦 Quick Start
+## 🚦 Quick Start (3 Steps - For Everyone!)
 
-### 1. Installation
+### Prerequisites
+- Docker installed on your system ([Download Docker](https://www.docker.com/products/docker-desktop/))
+- MongoDB running (either locally or in your Next.js app)
+- OpenAI API key
+
+### Step 1: Setup Environment
 
 ```bash
-# Clone repository
+# 1. Navigate to project folder
 cd flash-ops
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Copy environment file
+# 2. Copy environment template
 cp .env.example .env
+
+# 3. Edit .env file with your settings
+# - Set MONGO_URI to your MongoDB connection (default: mongodb://localhost:27017)
+# - Set MONGO_DB_ID to your database ID
+# - Set OPENAI_API_KEY to your OpenAI key
 ```
 
-### 2. Configure Environment
-
-Edit `.env` file:
+**Important:** If MongoDB is on your host machine, use this in `.env`:
 ```bash
-# MongoDB connection
-MONGO_URI=mongodb://localhost:27017
-MONGO_DB_ID=6919f70d1e144e4ea1b53ff4
-
-# OpenAI API Key (temporary)
-OPENAI_API_KEY=your-key-here
+# For MongoDB running on host machine (outside Docker)
+MONGO_URI=mongodb://host.docker.internal:27017
 ```
 
-### 3. Generate Embeddings
+### Step 2: Start Everything (One Command!)
 
 ```bash
-# Start the API server
-uvicorn app.main:app --reload
-
-# In another terminal, generate embeddings
-curl -X POST "http://localhost:8000/api/v1/embeddings/generate/default"
-```
-
-### 4. Run Queries
-
-```bash
-# Query endpoint
-curl -X POST "http://localhost:8000/api/v1/query/" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "show all active employees"}'
-```
-
-## 🐳 Docker Setup
-
-```bash
-# Start all services (API + MongoDB + Jupyter)
+# Start all services with Docker
 cd docker
 docker-compose up -d
 
-# View logs
-docker-compose logs -f app
+# Wait 30-60 seconds for services to be ready
+```
 
-# Stop services
+That's it! All services are now running:
+- ✅ **API Server**: http://localhost:8000
+- ✅ **Attu UI** (Milvus Admin): http://localhost:3001
+- ✅ **MinIO** (Storage): http://localhost:9001
+- ✅ **Milvus** (Vector DB): Ready internally
+
+### Step 3: Generate Embeddings & Test
+
+```bash
+# Generate embeddings for your database (first time only)
+curl -X POST "http://localhost:8000/api/v1/embeddings/generate/default"
+
+# Test with a query
+curl -X POST "http://localhost:8000/api/v1/query/" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "show top 10 products"}'
+```
+
+### View Logs (Optional)
+
+```bash
+# View all logs
+docker-compose logs -f
+
+# View API logs only
+docker-compose logs -f fastapi
+
+# Stop everything
 docker-compose down
 ```
 
-**Services:**
-- API: http://localhost:8000
-- Jupyter: http://localhost:8888
-- MongoDB: localhost:27017
+## 🐳 Docker Services
+
+The docker-compose setup includes:
+
+| Service | Container | Port | Purpose |
+|---------|-----------|------|---------|
+| FastAPI | `flash-ops-api` | 8000 | Main API server |
+| Milvus | `milvus-standalone` | 19530 | Vector database |
+| Attu | `milvus-attu` | 3001 | Milvus web UI |
+| MinIO | `milvus-minio` | 9000, 9001 | Object storage |
+| etcd | `milvus-etcd` | 2379 | Milvus metadata |
+
+**Note:** MongoDB is NOT included in Docker - use your existing MongoDB instance.
+
+## 💻 Local Development (For Developers)
+
+If you prefer running without Docker:
+
+```bash
+# 1. Create virtual environment
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Setup environment
+cp .env.example .env
+# Edit .env with your settings
+
+# 4. Start services manually
+# - Start MongoDB (if not running)
+# - Start Milvus with: docker-compose up -d milvus minio etcd attu
+
+# 5. Run FastAPI
+uvicorn app.main:app --reload --port 8000
+```
 
 ## 📊 API Endpoints
 
@@ -197,22 +236,23 @@ docker-compose down
 {
   "status": "healthy",
   "version": "1.0.0",
-  "faiss_index_loaded": true,
-  "mongo_connected": true,
-  "duckdb_connected": true
+  "milvus_loaded": true,
+  "mongo_connected": true
 }
 ```
 
 ## 📈 Visualization
 
-Open Jupyter notebook for interactive visualization:
+You can access Milvus data through:
 
+**Attu Web UI** (Recommended):
+- Open http://localhost:3001
+- Browse collections, view embeddings, and manage data
+- No setup required - included in Docker
+
+**Jupyter Notebooks** (Optional):
 ```bash
-# With Docker
-docker-compose up jupyter
-# Navigate to http://localhost:8888
-
-# Or locally
+# Run locally
 jupyter notebook notebooks/visualize.ipynb
 ```
 
@@ -310,4 +350,4 @@ For issues and questions:
 
 ---
 
-**Built with ❤️ using FastAPI, FAISS, and clean architecture principles**
+**Built with ❤️ using FastAPI, Milvus, MongoDB, and clean architecture principles**
