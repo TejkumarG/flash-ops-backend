@@ -122,6 +122,113 @@ class SchemaPackager:
         logger.debug(f"[SCHEMA PACKAGE PREVIEW] First 500 chars:\n{schema_package[:500]}")
         return schema_package
 
+    def package_multiple_schemas(
+        self,
+        combinations: List[Dict[str, Any]],
+        query: str
+    ) -> str:
+        """
+        Package multiple table combinations into a single prompt for LLM to choose from.
+
+        Args:
+            combinations: List of table combinations (primary + alternatives)
+            query: Original natural language query
+
+        Returns:
+            Formatted schema package string with all combinations
+        """
+        logger.info(f"[MULTI-SCHEMA PACKAGER] Packaging {len(combinations)} combinations in single prompt")
+
+        package_parts = []
+
+        # Header
+        package_parts.append("=" * 60)
+        package_parts.append(f"QUERY: {query}")
+        package_parts.append("=" * 60)
+        package_parts.append("")
+        package_parts.append(f"You have {len(combinations)} table combination options.")
+        package_parts.append("Analyze all options and choose the BEST one for this query.")
+        package_parts.append("")
+
+        # Format each combination
+        for combo_idx, selection in enumerate(combinations, 1):
+            tables = selection["selected_tables"]
+            joins = selection.get("joins", [])
+            tier = selection["tier"]
+            confidence = selection.get("confidence", 0)
+
+            package_parts.append("#" * 60)
+            package_parts.append(f"OPTION {combo_idx} (Confidence: {confidence:.3f}, Tier: {tier})")
+            package_parts.append("#" * 60)
+            package_parts.append("")
+
+            # List table names for quick overview
+            table_names = [t["table_name"] for t in tables]
+            package_parts.append(f"Tables: {', '.join(table_names)}")
+            package_parts.append(f"Pattern: {selection.get('join_pattern', 'unknown')}")
+            package_parts.append("")
+
+            # Table schemas
+            for idx, table_meta in enumerate(tables, 1):
+                table_name = table_meta["table_name"]
+                package_parts.append("-" * 60)
+                package_parts.append(f"TABLE {idx}: {table_name}")
+                package_parts.append("-" * 60)
+
+                # Use schema from table metadata
+                if 'columns' in table_meta:
+                    columns = table_meta['columns']
+                    package_parts.append("Columns:")
+                    for col in columns:
+                        col_info = f"  • {col['name']} ({col['type']})"
+                        if col.get('is_primary_key'):
+                            col_info += " [PK]"
+                        if col.get('is_foreign_key'):
+                            col_info += f" [FK -> {col.get('references')}]"
+                        if not col.get('nullable', True):
+                            col_info += " [NOT NULL]"
+                        package_parts.append(col_info)
+                    package_parts.append("")
+
+                    # Add row count
+                    if 'row_count' in table_meta:
+                        package_parts.append(f"Rows: ~{table_meta['row_count']:,}")
+                        package_parts.append("")
+                else:
+                    package_parts.append("[Schema not available]")
+                    package_parts.append("")
+
+            # Joins for this combination
+            if joins:
+                package_parts.append("JOINS:")
+                for idx, join in enumerate(joins, 1):
+                    package_parts.append(f"  {idx}. {join['condition']} (Type: {join['type'].upper()})")
+                package_parts.append("")
+
+            package_parts.append("")
+
+        # Final instructions
+        package_parts.append("=" * 60)
+        package_parts.append("INSTRUCTIONS")
+        package_parts.append("=" * 60)
+        package_parts.append("")
+        package_parts.append("1. Analyze all options above")
+        package_parts.append("2. Choose the BEST option for answering the query")
+        package_parts.append("3. Generate SQL using ONLY the chosen option's tables and columns")
+        package_parts.append("")
+        package_parts.append("SQL Rules:")
+        package_parts.append("  - Use Microsoft SQL Server (T-SQL) syntax")
+        package_parts.append("  - Use SELECT TOP N instead of LIMIT")
+        package_parts.append("  - Use table aliases (t1, t2, t3)")
+        package_parts.append("  - Use ONLY columns from the chosen option")
+        package_parts.append("  - Return ONLY the SQL query, no explanation")
+        package_parts.append("")
+
+        schema_package = "\n".join(package_parts)
+
+        logger.info(f"[MULTI-SCHEMA PACKAGER OUTPUT] Package created: {len(schema_package)} characters")
+        return schema_package
+
 
 def create_schema_packager() -> SchemaPackager:
     """Factory function to create Schema Packager instance."""
