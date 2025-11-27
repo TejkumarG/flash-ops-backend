@@ -81,66 +81,117 @@ class QueryPipeline:
             if "alternatives" in selection and selection["alternatives"]:
                 combinations.extend(selection["alternatives"])
 
-            logger.info(f"[MULTI-COMBINATION] Sending {len(combinations)} combinations to LLM in single call")
+            logger.info(f"[AVAILABLE COMBINATIONS] {len(combinations)} table combinations available")
             for idx, combo in enumerate(combinations, 1):
                 combo_tables = ', '.join([t.get('table_name', 'unknown') for t in combo['selected_tables']])
                 logger.info(f"  Option {idx}: {combo_tables} (confidence: {combo['confidence']:.3f}, tier: {combo['tier']})")
 
-            # Stage 4: Schema Packaging (all combinations in single prompt)
-            logger.info("Stage 4: Multi-Schema Packaging")
-            schema_package = self.schema_packager.package_multiple_schemas(combinations, query)
+            # Retry logic: max 2 attempts, exclude used combinations
+            MAX_ATTEMPTS = 2
+            used_combination_indices = []
+            available_combinations = combinations.copy()
 
-            # Stage 5: SQL Generation (single LLM call with all options)
-            logger.info("Stage 5: SQL Generation (LLM will choose best option)")
-            sql, errors = self._generate_sql_with_reflection(schema_package, database_id)
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                logger.info(f"[ATTEMPT {attempt}/{MAX_ATTEMPTS}] Trying with {len(available_combinations)} combinations")
 
-            if not sql:
-                return self._error_response(
-                    query,
-                    f"Failed to generate valid SQL from {len(combinations)} combinations",
-                    [f"Errors: {', '.join(errors)}"],
-                    int((time.time() - start_time) * 1000)
+                # Stage 4: Schema Packaging - Pass available combinations to LLM
+                schema_package = self.schema_packager.package_multiple_schemas(available_combinations, query)
+
+                # Stage 5: SQL Generation - LLM chooses best combination and generates SQL
+                sql, errors = self._generate_sql_with_reflection(schema_package, database_id)
+
+                if not sql:
+                    logger.warning(f"[ATTEMPT {attempt}] SQL generation failed: {errors}")
+                    if attempt == MAX_ATTEMPTS:
+                        return self._error_response(
+                            query,
+                            f"SQL generation failed: {errors[0] if errors else 'Unknown error'}",
+                            ["Check table schemas", "Try rephrasing your query"],
+                            int((time.time() - start_time) * 1000)
+                        )
+                    continue
+
+                # Stage 6-7: Validation and Execution
+                is_valid, error_msg, results, row_count = self.quality_inspector.validate_and_execute(sql, database_id)
+
+                if not is_valid:
+                    logger.warning(f"[ATTEMPT {attempt}] SQL validation/execution failed: {error_msg}")
+                    if attempt == MAX_ATTEMPTS:
+                        return self._error_response(
+                            query,
+                            f"SQL validation/execution failed: {error_msg}",
+                            ["Check SQL syntax", "Verify table/column names"],
+                            int((time.time() - start_time) * 1000)
+                        )
+                    continue
+
+                # Identify which combination was used by matching tables in SQL
+                used_combo, used_combo_idx = self._identify_used_combination(sql, available_combinations)
+
+                if used_combo:
+                    combo_tables = [t.get('table_name', 'unknown') for t in used_combo['selected_tables']]
+                    logger.info(f"[ATTEMPT {attempt}] LLM selected combination: {', '.join(combo_tables)}")
+                else:
+                    # Fallback: use first combination
+                    combo_tables = [t.get('table_name', 'unknown') for t in available_combinations[0]['selected_tables']]
+                    used_combo = available_combinations[0]
+
+                # Check for 0 results
+                if row_count == 0 and attempt < MAX_ATTEMPTS:
+                    logger.warning(f"[ATTEMPT {attempt}] Query returned 0 rows, will retry with different combinations")
+
+                    # Remove the used combination from available options
+                    if used_combo_idx is not None:
+                        original_idx = combinations.index(available_combinations[used_combo_idx])
+                        used_combination_indices.append(original_idx)
+                        available_combinations = [c for i, c in enumerate(combinations) if i not in used_combination_indices]
+
+                        if not available_combinations:
+                            logger.warning(f"[ATTEMPT {attempt}] No more combinations to try")
+                            break
+
+                        logger.info(f"[RETRY] Excluding combination {original_idx + 1}, {len(available_combinations)} combinations remaining")
+                    continue
+
+                # Success or last attempt - return result
+                if row_count == 0:
+                    logger.warning(f"[FINAL ATTEMPT] Attempt {attempt} returned 0 rows, showing result anyway")
+                    json_results = []
+                    file_path = None
+                    formatted_result = "No results found for this query."
+                else:
+                    json_results, file_path, formatted_result = self.quality_inspector.format_response(
+                        sql, results, row_count, query, combo_tables, database_id
+                    )
+
+                execution_time = int((time.time() - start_time) * 1000)
+
+                response = QueryResponse(
+                    status=QueryStatus.SUCCESS,
+                    query=query,
+                    tables_used=combo_tables,
+                    tier=used_combo.get("tier", 1),
+                    row_count=row_count,
+                    result=json_results,
+                    csv_path=None,
+                    sql_generated=sql,
+                    joins=self._format_joins(used_combo.get("joins", [])),
+                    execution_time_ms=execution_time,
+                    confidence=used_combo.get("confidence", 0.5),
+                    formatted_result=formatted_result,
+                    file_path=file_path
                 )
 
-            # Stage 6 & 7: Validation and Execution
-            logger.info("Stage 6-7: Validation and Execution")
-            is_valid, error_msg, results, row_count = self.quality_inspector.validate_and_execute(sql, database_id)
+                logger.info(f"[SUCCESS] Attempt {attempt} completed: {row_count} rows in {execution_time}ms")
+                return response
 
-            if not is_valid:
-                return self._error_response(
-                    query,
-                    f"SQL validation/execution failed: {error_msg}",
-                    ["Check table names and column names", "Verify query semantics"],
-                    int((time.time() - start_time) * 1000)
-                )
-
-            # Format results with LLM summary
-            tables_used = [t["table_name"] for t in selection["selected_tables"]]
-            json_results, file_path, formatted_result = self.quality_inspector.format_response(
-                sql, results, row_count, query, tables_used, database_id
+            # All attempts failed
+            return self._error_response(
+                query,
+                f"Failed after {MAX_ATTEMPTS} attempts with different table combinations",
+                ["Try rephrasing your query", "Check if data exists for this query"],
+                int((time.time() - start_time) * 1000)
             )
-
-            # Build response
-            execution_time = int((time.time() - start_time) * 1000)
-
-            response = QueryResponse(
-                status=QueryStatus.SUCCESS,
-                query=query,
-                tables_used=tables_used,
-                tier=selection["tier"],
-                row_count=row_count,
-                result=json_results,
-                csv_path=None,  # Deprecated - keeping for backward compatibility
-                sql_generated=sql,
-                joins=self._format_joins(selection.get("joins", [])),
-                execution_time_ms=execution_time,
-                confidence=selection.get("confidence", 0.5),
-                formatted_result=formatted_result,
-                file_path=file_path
-            )
-
-            logger.info(f"Query processed successfully in {execution_time}ms")
-            return response
 
         except Exception as e:
             logger.error(f"Pipeline error: {e}", exc_info=True)
@@ -210,6 +261,47 @@ class QueryPipeline:
             extractor.close()
             logger.error(f"Error in SQL reflection: {e}")
             return None, [str(e)]
+
+    def _identify_used_combination(
+        self,
+        sql: str,
+        combinations: list
+    ) -> tuple:
+        """
+        Identify which combination was used by parsing SQL and matching tables.
+
+        Args:
+            sql: Generated SQL query
+            combinations: List of available combinations
+
+        Returns:
+            Tuple of (combination_dict, index) or (None, None) if no match
+        """
+        import re
+
+        # Extract table names from SQL (simple pattern matching)
+        # Match FROM/JOIN tablename or FROM/JOIN tablename alias
+        table_pattern = r'(?:FROM|JOIN)\s+([a-zA-Z0-9_\$\'\-]+)'
+        sql_tables = re.findall(table_pattern, sql, re.IGNORECASE)
+
+        # Clean table names (remove quotes, aliases)
+        sql_tables = [t.strip().strip("'\"") for t in sql_tables]
+        sql_tables_set = set(sql_tables)
+
+        logger.debug(f"[COMBO MATCH] SQL uses tables: {sql_tables_set}")
+
+        # Try to match with combinations
+        for idx, combo in enumerate(combinations):
+            combo_tables = set(t.get('table_name', '') for t in combo['selected_tables'])
+            logger.debug(f"[COMBO MATCH] Option {idx + 1} has tables: {combo_tables}")
+
+            # Check if all combo tables are in SQL (allowing for partial matches)
+            if combo_tables.issubset(sql_tables_set) or sql_tables_set.issubset(combo_tables):
+                logger.info(f"[COMBO MATCH] Matched to combination {idx + 1}")
+                return combo, idx
+
+        logger.warning(f"[COMBO MATCH] Could not match SQL tables to any combination")
+        return None, None
 
     def _format_joins(self, joins: list) -> list:
         """Format joins for response."""

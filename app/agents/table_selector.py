@@ -118,30 +118,36 @@ class TableSelector:
 
     def _enrich_table_with_metadata(self, table: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Enrich table dictionary with column metadata from MSSQL.
+        Enrich table dictionary with column metadata.
+        Uses schema from Milvus (already included in table dict) to avoid unnecessary MSSQL queries.
 
         Args:
-            table: Table dict with at least {table_name, score}
+            table: Table dict from Milvus with {table_name, score, columns}
 
         Returns:
-            Enriched table dict with columns info added
+            Table dict (already enriched from Milvus)
         """
         table_name = table.get("table_name")
-        if not table_name or not self._current_database_id:
-            logger.warning(f"Cannot enrich table {table_name}, missing name or database_id")
+
+        # Check if columns are already present from Milvus
+        if 'columns' in table and table['columns']:
+            logger.debug(f"[TABLE ALREADY ENRICHED] {table_name}: {len(table['columns'])} columns from Milvus")
             return table
 
-        # Get metadata from MSSQL
+        # Fallback: Only fetch from MSSQL if columns are missing from Milvus
+        if not self._current_database_id:
+            logger.warning(f"Cannot enrich table {table_name}, missing database_id")
+            return table
+
+        logger.warning(f"[MSSQL FALLBACK] Fetching schema for {table_name} (not in Milvus)")
         metadata = self._get_table_metadata(table_name, self._current_database_id)
 
         if metadata and 'columns' in metadata:
-            # Add columns to table dict
             enriched = table.copy()
             enriched['columns'] = metadata['columns']
             if 'row_count' in metadata:
                 enriched['row_count'] = metadata['row_count']
-            logger.info(f"[TABLE ENRICHED] {table_name}: {len(metadata['columns'])} columns, {metadata.get('row_count', 0)} rows")
-            logger.debug(f"[ENRICHED COLUMNS] {table_name}: {[col['name'] for col in metadata['columns']]}")
+            logger.info(f"[TABLE ENRICHED FROM MSSQL] {table_name}: {len(metadata['columns'])} columns")
             return enriched
         else:
             logger.warning(f"[TABLE ENRICHMENT FAILED] No metadata found for table {table_name}")
