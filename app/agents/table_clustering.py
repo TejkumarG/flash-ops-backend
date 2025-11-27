@@ -1,9 +1,9 @@
 """
-Table Clustering: Group similar tables together.
+Table Clustering: Group tables into semantically different domains.
 Stage 2 of the pipeline.
 """
 import numpy as np
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -15,40 +15,47 @@ logger = setup_logger("table_clustering")
 
 
 class TableClustering:
-    """Agent for clustering similar tables together."""
+    """Agent for clustering tables into semantically different domains."""
 
     def __init__(self):
         """Initialize Table Clustering agent."""
         self.vector_store = get_vector_store()
 
-    def cluster_tables(
+    def cluster_tables_by_semantic_difference(
         self,
         tables: List[Dict[str, Any]],
-        threshold: float = None
+        max_clusters: int = 3
     ) -> List[List[Dict[str, Any]]]:
         """
-        Cluster tables by semantic similarity.
+        Cluster tables into semantically DIFFERENT domains using tiered approach.
+
+        Strategy:
+        - Group tables by semantic similarity to create topic clusters
+        - Each cluster represents a different semantic domain
+        - Returns full clusters (not just representatives)
+
+        Example for 30 tables:
+        - Cluster 1: 15 tables (primary domain - highest scores)
+        - Cluster 2: 10 tables (secondary domain)
+        - Cluster 3: 5 tables (tertiary domain)
 
         Args:
-            tables: List of table metadata from Schema Scout
-            threshold: Similarity threshold for clustering (default: from settings)
+            tables: List of table metadata from Schema Scout (sorted by score)
+            max_clusters: Maximum number of semantic clusters to create (default: 3)
 
         Returns:
-            List of clusters, each cluster is a list of tables:
+            List of clusters, each containing ALL tables in that semantic domain:
             [
-                [table1, table2, table3],  # Cluster 1
-                [table4, table5],          # Cluster 2
-                [table6],                  # Cluster 3 (single table)
-                ...
+                [table1, table2, ..., table15],  # Cluster 1 (primary domain)
+                [table16, table17, ..., table25], # Cluster 2 (secondary domain)
+                [table26, table27, ..., table30]  # Cluster 3 (tertiary domain)
             ]
         """
-        if threshold is None:
-            threshold = settings.CLUSTERING_SIMILARITY_THRESHOLD
-
         if len(tables) <= 1:
+            logger.info(f"Only {len(tables)} table(s), returning as single cluster")
             return [tables]
 
-        logger.info(f"Clustering {len(tables)} tables with threshold {threshold}")
+        logger.info(f"Clustering {len(tables)} tables into max {max_clusters} semantic domains")
 
         # Get embeddings for all tables
         embeddings = self._get_table_embeddings(tables)
@@ -59,11 +66,10 @@ class TableClustering:
         # Convert similarity to distance for clustering
         distance_matrix = 1 - similarity_matrix
 
-        # Apply agglomerative clustering
-        distance_threshold = 1 - threshold  # Convert similarity to distance
+        # Apply agglomerative clustering with fixed number of clusters
+        n_clusters = min(max_clusters, len(tables))
         clustering = AgglomerativeClustering(
-            n_clusters=None,
-            distance_threshold=distance_threshold,
+            n_clusters=n_clusters,
             metric='precomputed',
             linkage='average'
         )
@@ -71,50 +77,25 @@ class TableClustering:
         labels = clustering.fit_predict(distance_matrix)
 
         # Group tables by cluster label
-        clusters = {}
+        cluster_dict = {}
         for idx, label in enumerate(labels):
-            if label not in clusters:
-                clusters[label] = []
-            clusters[label].append(tables[idx])
+            if label not in cluster_dict:
+                cluster_dict[label] = []
+            cluster_dict[label].append(tables[idx])
 
-        # Convert to list of clusters
-        cluster_list = list(clusters.values())
+        # Convert to list and sort clusters by size (descending)
+        clusters = sorted(cluster_dict.values(), key=len, reverse=True)
 
-        logger.info(f"Created {len(cluster_list)} clusters")
-        for i, cluster in enumerate(cluster_list):
-            logger.debug(
-                f"Cluster {i}: {len(cluster)} tables - "
-                f"{[t['table_name'] for t in cluster[:3]]}"
+        logger.info(f"Created {len(clusters)} semantic domain clusters")
+        for i, cluster in enumerate(clusters):
+            avg_score = sum(t.get('score', 0) for t in cluster) / len(cluster)
+            table_names = [t['table_name'] for t in cluster[:3]]
+            logger.info(
+                f"Cluster {i+1}: {len(cluster)} tables, avg_score={avg_score:.3f}, "
+                f"sample={table_names}{'...' if len(cluster) > 3 else ''}"
             )
 
-        return cluster_list
-
-    def get_cluster_representatives(
-        self,
-        clusters: List[List[Dict[str, Any]]]
-    ) -> List[Dict[str, Any]]:
-        """
-        Get best representative from each cluster (highest score).
-
-        Args:
-            clusters: List of table clusters
-
-        Returns:
-            List of representative tables (one per cluster)
-        """
-        representatives = []
-
-        for cluster in clusters:
-            # Sort by score (descending) and pick the best
-            best_table = max(cluster, key=lambda t: t.get('score', 0))
-            representatives.append(best_table)
-
-        logger.info(
-            f"Selected {len(representatives)} cluster representatives: "
-            f"{[t['table_name'] for t in representatives]}"
-        )
-
-        return representatives
+        return clusters
 
     def _get_table_embeddings(self, tables: List[Dict[str, Any]]) -> np.ndarray:
         """

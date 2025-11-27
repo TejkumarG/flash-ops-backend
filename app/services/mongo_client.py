@@ -203,6 +203,106 @@ class MongoDBClient:
             logger.error(f"Error getting connection config: {e}")
             raise
 
+    def fetch_specific_tables(self, db_id: str, table_names: List[str]) -> List[Dict[str, Any]]:
+        """
+        Fetch specific tables by name from the database.
+
+        Args:
+            db_id: MongoDB database document ID
+            table_names: List of table names to fetch
+
+        Returns:
+            List of table metadata dicts
+        """
+        if not self.connected:
+            raise ConnectionError("MongoDB not connected")
+
+        if not table_names:
+            logger.warning("No table names provided to fetch")
+            return []
+
+        try:
+            # Get connection config
+            config_data = self.get_database_connection_config(db_id)
+            database_name = config_data["database_name"]
+            connection_config = config_data["connection_config"]
+
+            # Create schema extractor
+            from app.services.schema_extractor import SchemaExtractor
+            extractor = SchemaExtractor(connection_config)
+
+            logger.info(f"Fetching {len(table_names)} specific tables from MSSQL database '{database_name}'")
+
+            # Fetch schema for each table
+            tables = []
+            for table_name in table_names:
+                try:
+                    columns = extractor.get_table_schema(table_name, database_name)
+                    row_count = extractor.get_row_count(table_name, database_name)
+
+                    if columns:
+                        # Construct full table metadata dict
+                        table_dict = {
+                            'table_name': table_name,
+                            'name': table_name,
+                            'columns': columns,
+                            'row_count': row_count
+                        }
+                        tables.append(table_dict)
+                        logger.info(f"Fetched schema for table: {table_name} ({len(columns)} columns, {row_count} rows)")
+                    else:
+                        logger.warning(f"Table {table_name} not found in database")
+                except Exception as e:
+                    logger.error(f"Error fetching schema for table {table_name}: {e}")
+                    continue
+
+            extractor.close()
+
+            logger.info(f"Successfully fetched {len(tables)} tables out of {len(table_names)} requested")
+            return tables
+
+        except Exception as e:
+            logger.error(f"Error fetching specific tables: {e}")
+            raise
+
+    def update_sync_status(self, db_id: str, status: str) -> bool:
+        """
+        Update database syncStatus field.
+
+        Args:
+            db_id: MongoDB database document ID
+            status: Sync status to set (e.g., "synced", "needs_sync", "syncing")
+
+        Returns:
+            True if update successful
+        """
+        if not self.connected:
+            raise ConnectionError("MongoDB not connected")
+
+        try:
+            databases_collection = self.db[settings.MONGO_COLLECTION]
+
+            result = databases_collection.update_one(
+                {"_id": ObjectId(db_id)},
+                {
+                    "$set": {
+                        "syncStatus": status,
+                        "updatedAt": "$$NOW"
+                    }
+                }
+            )
+
+            if result.modified_count > 0:
+                logger.info(f"Updated database {db_id} syncStatus to '{status}'")
+                return True
+            else:
+                logger.warning(f"Failed to update database {db_id} syncStatus")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error updating sync status: {e}")
+            raise
+
 
 # Global singleton instance
 _mongo_client = None

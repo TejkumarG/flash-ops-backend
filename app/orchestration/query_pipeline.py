@@ -67,14 +67,14 @@ class QueryPipeline:
                     int((time.time() - start_time) * 1000)
                 )
 
-            # Stage 2: Table Clustering
-            logger.info("Stage 2: Table Clustering")
-            clusters = self.table_clustering.cluster_tables(top_tables)
-            cluster_representatives = self.table_clustering.get_cluster_representatives(clusters)
+            # Stage 2: Table Clustering (Semantic Difference Strategy)
+            logger.info("Stage 2: Semantic Difference Clustering")
+            clusters = self.table_clustering.cluster_tables_by_semantic_difference(top_tables, max_clusters=3)
+            logger.info(f"Created {len(clusters)} semantic domain clusters with sizes: {[len(c) for c in clusters]}")
 
-            # Stage 3: Table Selection (with alternatives)
-            logger.info("Stage 3: Table Selection")
-            selection = self.table_selector.select_tables(cluster_representatives, database_id)
+            # Stage 3: Cross-Cluster Table Selection (with Dynamic Threshold Scoring)
+            logger.info("Stage 3: Cross-Cluster Table Selection with Dynamic Scoring")
+            selection = self.table_selector.select_tables_with_cross_cluster_strategy(clusters, database_id)
 
             # Collect all combinations (primary + alternatives)
             combinations = [selection]  # Primary selection

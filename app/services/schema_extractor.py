@@ -2,7 +2,7 @@
 Database schema extractor for reading table metadata from various databases.
 """
 import pytds
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from app.utils.logger import setup_logger
 from app.utils.encryption import decrypt_password
 
@@ -283,6 +283,27 @@ class SchemaExtractor:
                 desc_by_table[table_name] = {}
             desc_by_table[table_name][column_name] = description
 
+        # 6. Get table descriptions for all tables in batch (1 query instead of N)
+        table_desc_query = f"""
+            SELECT
+                t.name AS table_name,
+                CAST(ep.value AS NVARCHAR(MAX)) AS description
+            FROM sys.tables t
+            LEFT JOIN sys.extended_properties ep
+                ON ep.major_id = t.object_id
+                AND ep.minor_id = 0
+                AND ep.name = 'MS_Description'
+            WHERE t.name IN ({placeholders})
+            AND ep.value IS NOT NULL
+        """
+        cursor.execute(table_desc_query, tuple(table_names))
+        table_desc_rows = cursor.fetchall()
+
+        # Map table descriptions
+        table_desc_by_name = {}
+        for row in table_desc_rows:
+            table_desc_by_name[row[0]] = row[1]
+
         # Build table metadata for each table
         table_schemas = []
         for table_name in table_names:
@@ -327,9 +348,13 @@ class SchemaExtractor:
                 'columns': columns
             }
 
+            # Add table description if available (user-provided from MSSQL extended properties)
+            if table_name in table_desc_by_name:
+                table_metadata['description'] = table_desc_by_name[table_name]
+
             table_schemas.append(table_metadata)
 
-        logger.info(f"Batch extracted schemas for {len(table_schemas)} tables with 5 queries (optimized)")
+        logger.info(f"Batch extracted schemas for {len(table_schemas)} tables with 6 queries (optimized)")
         return table_schemas
 
     def _get_table_schema(self, cursor, table_name: str) -> Dict[str, Any]:
@@ -413,6 +438,42 @@ class SchemaExtractor:
         count_result = cursor.fetchone()
         row_count = count_result[0] if count_result and count_result[0] else 0
 
+        # Get table description (user-provided from MSSQL extended properties)
+        table_desc_query = """
+            SELECT CAST(ep.value AS NVARCHAR(MAX)) AS description
+            FROM sys.tables t
+            LEFT JOIN sys.extended_properties ep
+                ON ep.major_id = t.object_id
+                AND ep.minor_id = 0
+                AND ep.name = 'MS_Description'
+            WHERE t.name = %s
+            AND ep.value IS NOT NULL
+        """
+        cursor.execute(table_desc_query, (table_name,))
+        table_desc_result = cursor.fetchone()
+        table_description = table_desc_result[0] if table_desc_result else None
+
+        # Get column descriptions (user-provided from MSSQL extended properties)
+        col_desc_query = """
+            SELECT
+                c.name AS column_name,
+                CAST(ep.value AS NVARCHAR(MAX)) AS description
+            FROM sys.tables t
+            INNER JOIN sys.columns c ON c.object_id = t.object_id
+            LEFT JOIN sys.extended_properties ep
+                ON ep.major_id = t.object_id
+                AND ep.minor_id = c.column_id
+                AND ep.name = 'MS_Description'
+            WHERE t.name = %s
+            AND ep.value IS NOT NULL
+        """
+        cursor.execute(col_desc_query, (table_name,))
+        col_desc_rows = cursor.fetchall()
+
+        col_desc_map = {}
+        for row in col_desc_rows:
+            col_desc_map[row[0]] = row[1]
+
         # Format columns
         columns = []
         for col in columns_data:
@@ -434,6 +495,10 @@ class SchemaExtractor:
             if col['COLUMN_DEFAULT']:
                 column_info['default'] = col['COLUMN_DEFAULT']
 
+            # Add column description if available
+            if col['COLUMN_NAME'] in col_desc_map:
+                column_info['description'] = col_desc_map[col['COLUMN_NAME']]
+
             columns.append(column_info)
 
         # Build table metadata
@@ -444,20 +509,24 @@ class SchemaExtractor:
             'columns': columns
         }
 
+        # Add table description if available (user-provided from MSSQL extended properties)
+        if table_description:
+            table_metadata['description'] = table_description
+
         logger.debug(f"Extracted schema for table '{table_name}': {len(columns)} columns, ~{row_count} rows")
 
         return table_metadata
 
-    def get_table_schema(self, table_name: str, database_name: str) -> List[Dict[str, Any]]:
+    def get_table_schema(self, table_name: str, database_name: str) -> Dict[str, Any]:
         """
-        Get schema (columns) for a single table.
+        Get schema (full metadata) for a single table.
 
         Args:
             table_name: Name of the table
             database_name: Database name
 
         Returns:
-            List of column dictionaries
+            Table metadata dictionary with table_name, columns, row_count, etc.
         """
         try:
             # Create temporary connection for schema fetch
@@ -478,6 +547,7 @@ class SchemaExtractor:
             table_metadata = self._get_table_schema(cursor, table_name)
             cursor.close()
 
+            # Return just the columns list for backwards compatibility with query pipeline
             return table_metadata.get('columns', [])
 
         except Exception as e:
@@ -610,6 +680,127 @@ class SchemaExtractor:
             return True, None
         except Exception as e:
             return False, str(e)
+
+    def write_table_descriptions_batch(
+        self,
+        database_name: str,
+        table_descriptions: List[Dict[str, str]]
+    ) -> Tuple[int, int, List[str]]:
+        """
+        Write table descriptions to MSSQL extended properties in batch.
+
+        Args:
+            database_name: Database name
+            table_descriptions: List of dicts with 'table_name' and 'description' keys
+
+        Returns:
+            Tuple of (num_added, num_updated, errors)
+        """
+        if self.connection_type != 'mssql':
+            raise NotImplementedError("Description writing only supported for MSSQL")
+
+        try:
+            # Decrypt password
+            encrypted_password = self.config.get('password', '')
+            password = decrypt_password(encrypted_password)
+
+            # Connect to MSSQL
+            logger.info(f"Connecting to MSSQL to write descriptions for {len(table_descriptions)} tables...")
+            connection = pytds.connect(
+                server=self.config.get('host'),
+                port=self.config.get('port', 1433),
+                user=self.config.get('username'),
+                password=password,
+                database=database_name,
+                autocommit=True
+            )
+
+            cursor = connection.cursor()
+
+            # Get table names that have descriptions to write
+            tables_with_desc = [td for td in table_descriptions if td.get('description')]
+
+            if not tables_with_desc:
+                logger.info("No descriptions to write")
+                cursor.close()
+                connection.close()
+                return 0, 0, []
+
+            table_names = [td['table_name'] for td in tables_with_desc]
+
+            # Check which tables already have extended properties
+            placeholders = ','.join(['%s'] * len(table_names))
+            check_query = f"""
+                SELECT t.name AS table_name
+                FROM sys.tables t
+                INNER JOIN sys.extended_properties ep
+                    ON ep.major_id = t.object_id
+                    AND ep.minor_id = 0
+                    AND ep.name = 'MS_Description'
+                WHERE t.name IN ({placeholders})
+            """
+
+            cursor.execute(check_query, tuple(table_names))
+            existing_tables = {row[0] for row in cursor.fetchall()}
+
+            logger.info(f"Found {len(existing_tables)} tables with existing descriptions")
+
+            num_added = 0
+            num_updated = 0
+            errors = []
+
+            # Write each description
+            for td in tables_with_desc:
+                table_name = td['table_name']
+                description = td['description']
+
+                try:
+                    # Escape single quotes for SQL
+                    escaped_desc = description.replace("'", "''")
+
+                    if table_name in existing_tables:
+                        # Update existing
+                        logger.info(f"[MSSQL WRITE] Updating MS_Description for table: {table_name}")
+                        logger.info(f"[MSSQL WRITE] Description: {description[:100]}{'...' if len(description) > 100 else ''}")
+                        query = f"""
+                            EXEC sp_updateextendedproperty
+                                @name = N'MS_Description',
+                                @value = N'{escaped_desc}',
+                                @level0type = N'SCHEMA', @level0name = 'dbo',
+                                @level1type = N'TABLE', @level1name = N'{table_name}'
+                        """
+                        cursor.execute(query)
+                        num_updated += 1
+                        logger.info(f"[MSSQL WRITE] ✓ Successfully updated MS_Description for {table_name}")
+                    else:
+                        # Add new
+                        logger.info(f"[MSSQL WRITE] Adding MS_Description for table: {table_name}")
+                        logger.info(f"[MSSQL WRITE] Description: {description[:100]}{'...' if len(description) > 100 else ''}")
+                        query = f"""
+                            EXEC sp_addextendedproperty
+                                @name = N'MS_Description',
+                                @value = N'{escaped_desc}',
+                                @level0type = N'SCHEMA', @level0name = 'dbo',
+                                @level1type = N'TABLE', @level1name = N'{table_name}'
+                        """
+                        cursor.execute(query)
+                        num_added += 1
+                        logger.info(f"[MSSQL WRITE] ✓ Successfully added MS_Description for {table_name}")
+
+                except Exception as e:
+                    error_msg = f"Failed to write description for {table_name}: {str(e)}"
+                    logger.error(f"[MSSQL WRITE] ✗ {error_msg}")
+                    errors.append(error_msg)
+
+            cursor.close()
+            connection.close()
+
+            logger.info(f"Batch write complete: {num_added} added, {num_updated} updated, {len(errors)} errors")
+            return num_added, num_updated, errors
+
+        except Exception as e:
+            logger.error(f"Error writing descriptions to MSSQL: {e}")
+            raise
 
     def close(self):
         """Close database connection."""

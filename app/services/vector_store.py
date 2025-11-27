@@ -12,6 +12,7 @@ from pymilvus import (
 )
 from sentence_transformers import SentenceTransformer
 import numpy as np
+import hashlib
 
 from app.config import settings
 from app.utils.logger import setup_logger
@@ -70,6 +71,24 @@ class MilvusVectorStore:
             self.connected = False
             self.loaded = False
             logger.info("Disconnected from Milvus")
+
+    def _generate_id(self, database_id: str, table_name: str) -> int:
+        """
+        Generate deterministic ID from database_id and table_name.
+
+        Args:
+            database_id: MongoDB database ID
+            table_name: Table name
+
+        Returns:
+            Deterministic 64-bit integer ID
+        """
+        # Create unique string
+        unique_str = f"{database_id}:{table_name}"
+        # Hash it
+        hash_bytes = hashlib.sha256(unique_str.encode()).digest()
+        # Convert first 8 bytes to int64 (positive)
+        return int.from_bytes(hash_bytes[:8], byteorder='big', signed=False) & 0x7FFFFFFFFFFFFFFF
 
     def _generate_semantic_description(self, table_name: str) -> str:
         """
@@ -142,10 +161,13 @@ class MilvusVectorStore:
             else:
                 # Create new collection
                 fields = [
-                    FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+                    FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
                     FieldSchema(name="database_id", dtype=DataType.VARCHAR, max_length=64),
                     FieldSchema(name="table_name", dtype=DataType.VARCHAR, max_length=512),
                     FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=4096),
+                    FieldSchema(name="schema", dtype=DataType.VARCHAR, max_length=8192),  # JSON schema of columns
+                    FieldSchema(name="needs_sync", dtype=DataType.BOOL),
+                    FieldSchema(name="skipped", dtype=DataType.BOOL),
                     FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.dimension)
                 ]
                 schema = CollectionSchema(fields, description="Table embeddings for NL2SQL")
@@ -177,40 +199,21 @@ class MilvusVectorStore:
                 for table in batch_tables:
                     table_name = table.get('table_name', '')
 
-                    # Create rich semantic text for better embedding quality
-                    # Start with table name and semantic variations
+                    # Create semantic text for embedding (table name + description only)
+                    # Columns are stored separately in the 'schema' field
                     text_parts = [f"Table: {table_name}"]
 
-                    # Add semantic description based on table name
-                    text_parts.append(self._generate_semantic_description(table_name))
-
-                    # Add column information with types
-                    if 'columns' in table and table['columns']:
-                        # List column names
-                        col_names = [c.get('name', '') for c in table['columns']]
-                        text_parts.append(f"Columns: {', '.join(col_names)}")
-
-                        # Add column types for better understanding
-                        col_types = []
-                        for col in table['columns']:
-                            col_name = col.get('name', '')
-                            col_type = col.get('type', '')
-                            if col_name and col_type:
-                                col_types.append(f"{col_name} ({col_type})")
-                        if col_types:
-                            text_parts.append(f"Schema: {', '.join(col_types[:10])}")  # Limit to 10 to avoid token limit
-
-                        # Add column descriptions if available (for better semantic search)
-                        col_descriptions = []
-                        for col in table['columns']:
-                            col_name = col.get('name', '')
-                            col_desc = col.get('description', '')
-                            if col_name and col_desc:
-                                # Truncate long descriptions to avoid token limits
-                                desc_truncated = col_desc[:200] if len(col_desc) > 200 else col_desc
-                                col_descriptions.append(f"{col_name}: {desc_truncated}")
-                        if col_descriptions:
-                            text_parts.append(f"Column Descriptions: {'; '.join(col_descriptions[:10])}")  # Limit to 10
+                    # Use user-provided description if available, otherwise generate one
+                    user_description = table.get('description')
+                    if user_description:
+                        # Use user-provided description from MSSQL extended properties
+                        text_parts.append(f"Description: {user_description}")
+                        logger.debug(f"[DESC] {table_name}: Using user description: {user_description[:100]}")
+                    else:
+                        # Fall back to auto-generated description from table name
+                        generated_desc = self._generate_semantic_description(table_name)
+                        text_parts.append(f"Description: {generated_desc}")
+                        logger.debug(f"[DESC] {table_name}: Using auto-generated description")
 
                     text = "\n".join(text_parts)
                     texts.append(text)
@@ -223,11 +226,22 @@ class MilvusVectorStore:
                 embeddings = self.model.encode(texts, show_progress_bar=False)
                 logger.info(f"Batch {batch_num}/{total_batches}: Generated embeddings with shape {embeddings.shape}")
 
-                # Prepare batch data - simplified schema
+                # Generate IDs for this batch
+                batch_ids = [
+                    self._generate_id(database_id, t.get('table_name', ''))
+                    for t in batch_tables
+                ]
+
+                # Prepare batch data - with schema
+                import json
                 batch_data = [
+                    batch_ids,  # Deterministic IDs for updating records
                     [database_id] * batch_count,  # database_id for all tables in batch
                     [t.get('table_name', '') for t in batch_tables],
                     [text[:4096] for text in texts],  # Store the text used for embedding
+                    [json.dumps(t.get('columns', []))[:8192] for t in batch_tables],  # Schema as JSON
+                    [False] * batch_count,  # needs_sync - always False after sync completion
+                    [False] * batch_count,  # skipped - always False initially (UI can control)
                     embeddings.tolist()
                 ]
 
@@ -271,7 +285,7 @@ class MilvusVectorStore:
         metric_type: str = "L2"
     ) -> List[Dict[str, Any]]:
         """
-        Search for similar tables using query, filtered by database_id.
+        Search for similar tables using query, filtered by database_id and skipped status.
 
         Args:
             query: Natural language query
@@ -280,7 +294,7 @@ class MilvusVectorStore:
             metric_type: Distance metric (L2 or IP)
 
         Returns:
-            List of similar tables with scores
+            List of similar tables with scores (excludes tables with skipped=true)
         """
         if not self.connected:
             raise ConnectionError("Milvus not connected")
@@ -304,14 +318,14 @@ class MilvusVectorStore:
                 "params": {"nprobe": 10}
             }
 
-            # Perform search with database_id filter
+            # Perform search with database_id and skipped filter
             results = self.collection.search(
                 data=query_embedding.tolist(),
                 anns_field="embedding",
                 param=search_params,
                 limit=k,
-                expr=f'database_id == "{database_id}"',  # Filter by database_id
-                output_fields=["database_id", "table_name", "text"]
+                expr=f'database_id == "{database_id}" && skipped == false',  # Filter by database_id and exclude skipped tables
+                output_fields=["database_id", "table_name", "text", "schema"]
             )
 
             # Format results
@@ -322,10 +336,20 @@ class MilvusVectorStore:
                     distance = hit.distance
                     score = 1.0 / (1.0 + distance) if metric_type == "L2" else hit.distance
 
+                    # Parse schema JSON back to Python object
+                    import json
+                    schema_json = hit.entity.get("schema") or "[]"
+                    try:
+                        columns = json.loads(schema_json) if schema_json else []
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse schema JSON for table {hit.entity.get('table_name')}")
+                        columns = []
+
                     table = {
                         "database_id": hit.entity.get("database_id"),
                         "table_name": hit.entity.get("table_name"),
                         "text": hit.entity.get("text"),
+                        "columns": columns,  # Include parsed columns
                         "score": score,
                         "distance": distance
                     }
@@ -367,6 +391,130 @@ class MilvusVectorStore:
                 "connected": False,
                 "error": str(e)
             }
+
+    def upsert_embeddings(
+        self,
+        tables: List[Dict[str, Any]],
+        database_id: str
+    ) -> Tuple[str, int]:
+        """
+        Upsert embeddings for tables (update if exists, insert if not).
+        Uses deterministic IDs for upsert functionality.
+
+        Args:
+            tables: List of table metadata
+            database_id: MongoDB database ID
+
+        Returns:
+            Tuple of (collection_name, num_vectors)
+        """
+        if not self.connected or not self.loaded:
+            raise ConnectionError("Milvus not connected or collection not loaded")
+
+        try:
+            # Load model
+            self._load_model()
+
+            # Process tables in batches
+            batch_size = settings.EMBEDDING_BATCH_SIZE
+            total_tables = len(tables)
+            total_upserted = 0
+
+            logger.info(f"Upserting {total_tables} tables...")
+
+            for batch_idx in range(0, total_tables, batch_size):
+                batch_tables = tables[batch_idx:batch_idx + batch_size]
+                batch_count = len(batch_tables)
+
+                # Generate embeddings for this batch
+                texts = []
+                for table in batch_tables:
+                    table_name = table.get('table_name', '')
+
+                    # Create semantic text for embedding (table name + description only)
+                    # Columns are stored separately in the 'schema' field
+                    text_parts = [f"Table: {table_name}"]
+
+                    # Use user-provided description if available, otherwise generate one
+                    user_description = table.get('description')
+                    if user_description:
+                        # Use user-provided description from MSSQL extended properties
+                        text_parts.append(f"Description: {user_description}")
+                        logger.debug(f"[DESC] {table_name}: Using user description: {user_description[:100]}")
+                    else:
+                        # Fall back to auto-generated description from table name
+                        generated_desc = self._generate_semantic_description(table_name)
+                        text_parts.append(f"Description: {generated_desc}")
+                        logger.debug(f"[DESC] {table_name}: Using auto-generated description")
+
+                    text = "\n".join(text_parts)
+                    texts.append(text)
+
+                # Encode batch
+                embeddings = self.model.encode(texts, show_progress_bar=False)
+
+                # Generate deterministic IDs
+                batch_ids = [
+                    self._generate_id(database_id, t.get('table_name', ''))
+                    for t in batch_tables
+                ]
+
+                # Prepare batch data with needs_sync=False
+                import json
+                batch_data = [
+                    batch_ids,
+                    [database_id] * batch_count,
+                    [t.get('table_name', '') for t in batch_tables],
+                    [text[:4096] for text in texts],
+                    [json.dumps(t.get('columns', []))[:8192] for t in batch_tables],  # Schema as JSON
+                    [False] * batch_count,  # needs_sync - set to False after sync
+                    [False] * batch_count,  # skipped
+                    embeddings.tolist()
+                ]
+
+                # Upsert batch (updates existing or inserts new)
+                self.collection.upsert(batch_data)
+                total_upserted += batch_count
+                logger.info(f"Upserted {batch_count} embeddings (total: {total_upserted}/{total_tables})")
+
+            # Flush to ensure updates are persisted
+            self.collection.flush()
+            logger.info(f"Upsert complete: {total_upserted} tables")
+
+            return self.collection_name, total_upserted
+
+        except Exception as e:
+            logger.error(f"Error upserting embeddings: {e}")
+            raise
+
+    def get_tables_needing_sync(self, database_id: str) -> List[Dict[str, Any]]:
+        """
+        Get all tables that need syncing (needs_sync=True) for a specific database.
+
+        Args:
+            database_id: MongoDB database ID
+
+        Returns:
+            List of tables with needs_sync=True
+        """
+        if not self.connected or not self.loaded:
+            raise ConnectionError("Milvus not connected or collection not loaded")
+
+        try:
+            # Query for tables with needs_sync=True for this database
+            expr = f'database_id == "{database_id}" && needs_sync == true'
+
+            results = self.collection.query(
+                expr=expr,
+                output_fields=["database_id", "table_name", "text", "needs_sync"]
+            )
+
+            logger.info(f"Found {len(results)} tables needing sync for database {database_id}")
+            return results
+
+        except Exception as e:
+            logger.error(f"Error querying tables needing sync: {e}")
+            raise
 
     def load_index(self) -> bool:
         """

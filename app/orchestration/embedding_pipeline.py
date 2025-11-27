@@ -42,21 +42,125 @@ class EmbeddingPipeline:
         logger.info(f"Generating embeddings for database ID: {db_id}")
 
         try:
-            # Check if embeddings already exist
+            # Check if this is an incremental sync (only tables with needs_sync=True)
             if not force_regenerate and self.vector_store.loaded:
-                stats = self.vector_store.get_stats()
-                num_entities = stats.get('num_entities', 0)
-                logger.info(f"Embeddings already synced for database. Collection has {num_entities} entities")
-                return EmbeddingGenerationResponse(
-                    status="success",
-                    message=f"Database already synced. Collection '{self.vector_store.collection_name}' contains {num_entities} table embeddings. Use force_regenerate=true to override.",
-                    tables_processed=num_entities,
-                    embeddings_created=0,
-                    index_path=f"milvus://{self.vector_store.collection_name}",
-                    metadata_path=f"milvus://{self.vector_store.collection_name}",
-                    processing_time_ms=int((time.time() - start_time) * 1000)
+                # Query Milvus for tables that need syncing
+                tables_needing_sync = self.vector_store.get_tables_needing_sync(db_id)
+
+                if not tables_needing_sync:
+                    # No tables need syncing
+                    stats = self.vector_store.get_stats()
+                    num_entities = stats.get('num_entities', 0)
+                    logger.info(f"No tables need syncing. Collection has {num_entities} entities")
+                    return EmbeddingGenerationResponse(
+                        status="success",
+                        message=f"Database already synced. No tables with needs_sync=true. Collection contains {num_entities} table embeddings. Use force_regenerate=true to regenerate all.",
+                        tables_processed=0,
+                        embeddings_created=0,
+                        index_path=f"milvus://{self.vector_store.collection_name}",
+                        metadata_path=f"milvus://{self.vector_store.collection_name}",
+                        processing_time_ms=int((time.time() - start_time) * 1000)
+                    )
+
+                # Sync only tables that need it
+                logger.info(f"=" * 80)
+                logger.info(f"INCREMENTAL SYNC: Found {len(tables_needing_sync)} tables with needs_sync=true")
+                logger.info(f"=" * 80)
+
+                # Use existing text from Milvus (edited in UI) - NO re-fetching from MSSQL
+                # Parse description from the text field
+                tables_to_sync = []
+                for table_entry in tables_needing_sync:
+                    table_name = table_entry['table_name']
+                    text = table_entry.get('text', '')
+
+                    # Extract description from text (format: "Table: name\nDescription: desc")
+                    description = None
+                    if '\nDescription: ' in text:
+                        # Split on newline and get the part after "Description: "
+                        parts = text.split('\nDescription: ', 1)
+                        if len(parts) > 1:
+                            description = parts[1].strip()
+
+                    # Create minimal table metadata (just name and description)
+                    table_metadata = {
+                        'table_name': table_name,
+                        'description': description  # Will be None if not found, which is fine
+                    }
+                    tables_to_sync.append(table_metadata)
+
+                    logger.info(f"  - {table_name}: {description[:80] if description else 'No description'}{'...' if description and len(description) > 80 else ''}")
+
+                logger.info(f"\nUsing existing text from Milvus for {len(tables_to_sync)} tables (no MSSQL re-fetch)")
+
+                # Write UI-edited descriptions to MSSQL for persistence
+                logger.info(f"\n{'=' * 80}")
+                logger.info(f"STEP 1: Writing UI-edited descriptions to MSSQL...")
+                logger.info(f"{'=' * 80}")
+                try:
+                    from app.services.schema_extractor import SchemaExtractor
+
+                    # Get database connection config
+                    config_data = self.mongo_client.get_database_connection_config(db_id)
+                    database_name = config_data["database_name"]
+                    connection_config = config_data["connection_config"]
+
+                    logger.info(f"Database: {database_name}")
+
+                    # Create schema extractor
+                    extractor = SchemaExtractor(connection_config)
+
+                    # Write descriptions in batch
+                    num_added, num_updated, errors = extractor.write_table_descriptions_batch(
+                        database_name,
+                        tables_to_sync
+                    )
+
+                    if errors:
+                        logger.warning(f"\n⚠ Some descriptions failed to write: {len(errors)} errors")
+                        for error in errors:
+                            logger.warning(f"  - {error}")
+
+                    logger.info(f"\n✓ MSSQL write complete: {num_added} added, {num_updated} updated, {len(errors)} errors")
+
+                    extractor.close()
+
+                except Exception as e:
+                    # Log warning but continue with re-embedding (MSSQL write is optional)
+                    logger.error(f"\n✗ Failed to write descriptions to MSSQL: {e}", exc_info=True)
+                    logger.info("Continuing with re-embedding despite MSSQL write failure")
+
+                # Upsert (update or insert) only these tables
+                logger.info(f"\n{'=' * 80}")
+                logger.info(f"STEP 2: Re-embedding {len(tables_to_sync)} tables with edited text from Milvus...")
+                logger.info(f"{'=' * 80}")
+                collection_name, num_vectors = self.vector_store.upsert_embeddings(
+                    tables_to_sync,
+                    db_id
                 )
 
+                processing_time = int((time.time() - start_time) * 1000)
+                logger.info(f"\n✓ Incremental sync complete: {len(tables_to_sync)} tables re-embedded in {processing_time}ms")
+                logger.info(f"{'=' * 80}")
+
+                # Update MongoDB syncStatus to "synced"
+                try:
+                    self.mongo_client.update_sync_status(db_id, "synced")
+                    logger.info(f"Updated MongoDB syncStatus to 'synced' for database {db_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to update MongoDB syncStatus: {e}")
+
+                return EmbeddingGenerationResponse(
+                    status="success",
+                    message=f"Incremental sync complete. Re-embedded {len(tables_to_sync)} tables that had needs_sync=true.",
+                    tables_processed=len(tables_to_sync),
+                    embeddings_created=num_vectors,
+                    index_path=f"milvus://{collection_name}",
+                    metadata_path=f"milvus://{collection_name}",
+                    processing_time_ms=processing_time
+                )
+
+            # Full sync (force_regenerate=True or collection not loaded)
             # Fetch tables from MongoDB (streaming generator)
             logger.info("Fetching tables from MongoDB (streaming)...")
             tables_generator = self.mongo_client.fetch_tables_for_database(db_id)
@@ -112,6 +216,13 @@ class EmbeddingPipeline:
                 f"Embeddings generated successfully in {processing_time}ms: "
                 f"{total_tables_processed} tables processed"
             )
+
+            # Update MongoDB syncStatus to "synced"
+            try:
+                self.mongo_client.update_sync_status(db_id, "synced")
+                logger.info(f"Updated MongoDB syncStatus to 'synced' for database {db_id}")
+            except Exception as e:
+                logger.warning(f"Failed to update MongoDB syncStatus: {e}")
 
             return EmbeddingGenerationResponse(
                 status="success",
