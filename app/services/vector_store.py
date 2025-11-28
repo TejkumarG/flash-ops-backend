@@ -338,17 +338,29 @@ class MilvusVectorStore:
 
                     # Parse schema JSON back to Python object
                     import json
-                    schema_json = hit.entity.get("schema") or "[]"
+                    # PyMilvus API: use dictionary-style access
+                    try:
+                        schema_json = hit.entity["schema"] if "schema" in hit.entity else "[]"
+                        table_name = hit.entity["table_name"] if "table_name" in hit.entity else ""
+                        database_id_val = hit.entity["database_id"] if "database_id" in hit.entity else ""
+                        text = hit.entity["text"] if "text" in hit.entity else ""
+                    except (TypeError, KeyError):
+                        # Fallback for older PyMilvus versions
+                        schema_json = hit.entity.get("schema") or "[]"
+                        table_name = hit.entity.get("table_name") or ""
+                        database_id_val = hit.entity.get("database_id") or ""
+                        text = hit.entity.get("text") or ""
+
                     try:
                         columns = json.loads(schema_json) if schema_json else []
                     except json.JSONDecodeError:
-                        logger.warning(f"Failed to parse schema JSON for table {hit.entity.get('table_name')}")
+                        logger.warning(f"Failed to parse schema JSON for table {table_name}")
                         columns = []
 
                     table = {
-                        "database_id": hit.entity.get("database_id"),
-                        "table_name": hit.entity.get("table_name"),
-                        "text": hit.entity.get("text"),
+                        "database_id": database_id_val,
+                        "table_name": table_name,
+                        "text": text,
                         "columns": columns,  # Include parsed columns
                         "score": score,
                         "distance": distance
