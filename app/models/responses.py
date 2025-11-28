@@ -112,4 +112,3 @@ class HealthResponse(BaseModel):
     version: str
     milvus_loaded: bool
     mongo_connected: bool
-    duckdb_connected: bool

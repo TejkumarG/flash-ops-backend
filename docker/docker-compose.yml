@@ -1,6 +1,20 @@
 version: '3.8'
 
 services:
+  # MongoDB
+  mongodb:
+    image: mongo:latest
+    container_name: flash-ops-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: flash-ops
+    restart: unless-stopped
+    networks:
+      - flash-ops-network
+
   # etcd for Milvus
   etcd:
     container_name: milvus-etcd
@@ -88,9 +102,8 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # MongoDB - Uses external/host MongoDB (configure in .env)
-      # For host MongoDB: mongodb://host.docker.internal:27017
-      # For Docker MongoDB on host: mongodb://localhost:27017
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DATABASE=flash-ops
       - MILVUS_HOST=milvus
       - MILVUS_PORT=19530
       - MINIO_ENDPOINT=minio:9000
@@ -102,6 +115,8 @@ services:
     volumes:
       - ../data:/app/data
     depends_on:
+      mongodb:
+        condition: service_started
       milvus:
         condition: service_healthy
       minio:
@@ -113,6 +128,7 @@ services:
       - "host.docker.internal:host-gateway"
 
 volumes:
+  mongo_data:
   etcd-data:
   minio-data:
   milvus-data:

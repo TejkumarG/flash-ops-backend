@@ -49,8 +49,7 @@ class Settings(BaseSettings):
     TEMPERATURE_START: float = 0.1
     TEMPERATURE_INCREMENT: float = 0.05
 
-    # Database (DuckDB)
-    DUCKDB_PATH: str = "data/database.duckdb"
+    # Query Settings
     CONNECTION_POOL_SIZE: int = 3
     QUERY_TIMEOUT_SECONDS: int = 30
 

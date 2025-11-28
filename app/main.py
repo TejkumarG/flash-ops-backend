@@ -80,8 +80,7 @@ async def health_check():
         status="healthy",
         version=settings.APP_VERSION,
         milvus_loaded=vector_store.loaded,
-        mongo_connected=mongo_client.connected,
-        duckdb_connected=False  # Legacy field, kept for API compatibility
+        mongo_connected=mongo_client.connected
     )
 
 
