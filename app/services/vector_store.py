@@ -111,6 +111,44 @@ class MilvusVectorStore:
         # Generate simple semantic description
         return f"This table contains {base_words} data and related information"
 
+    def _extract_field_descriptions(self, columns: list) -> list:
+        """
+        Extract field descriptions from columns list.
+        Includes ALL columns with empty description if not provided (for UI editing).
+
+        Args:
+            columns: List of column dicts with 'name' and optionally 'description'
+
+        Returns:
+            List of dicts with 'field_name' and 'description' for ALL fields
+        """
+        field_descriptions = []
+        for col in columns:
+            col_name = col.get('name', '')
+            col_desc = col.get('description', '')  # Empty string if no description
+            field_descriptions.append({
+                'field_name': col_name,
+                'description': col_desc if col_desc else ''  # Ensure empty string, not None
+            })
+        return field_descriptions
+
+    def _format_field_descriptions_for_embedding(self, field_descriptions: list) -> str:
+        """
+        Format field descriptions for embedding text.
+        Only includes fields that have non-empty descriptions.
+
+        Args:
+            field_descriptions: List of dicts with 'field_name' and 'description'
+
+        Returns:
+            Formatted string like "field1: desc1, field2: desc2" (only non-empty descriptions)
+        """
+        if not field_descriptions:
+            return ""
+        # Only include fields with non-empty descriptions for embedding
+        parts = [f"{fd['field_name']}: {fd['description']}" for fd in field_descriptions if fd.get('description')]
+        return ", ".join(parts)
+
     def _load_model(self):
         """Load sentence transformer model."""
         if self.model is None:
@@ -164,8 +202,10 @@ class MilvusVectorStore:
                     FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
                     FieldSchema(name="database_id", dtype=DataType.VARCHAR, max_length=64),
                     FieldSchema(name="table_name", dtype=DataType.VARCHAR, max_length=512),
-                    FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=4096),
-                    FieldSchema(name="schema", dtype=DataType.VARCHAR, max_length=8192),  # JSON schema of columns
+                    FieldSchema(name="description", dtype=DataType.VARCHAR, max_length=4096),  # Table description (separate field)
+                    FieldSchema(name="field_descriptions", dtype=DataType.VARCHAR, max_length=32768),  # JSON list of field descriptions (32KB)
+                    FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=16384),  # Embedding text: Table + Description + Field Descriptions (16KB)
+                    FieldSchema(name="schema", dtype=DataType.VARCHAR, max_length=32768),  # JSON schema of columns (32KB for large tables)
                     FieldSchema(name="needs_sync", dtype=DataType.BOOL),
                     FieldSchema(name="skipped", dtype=DataType.BOOL),
                     FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self.dimension)
@@ -195,25 +235,38 @@ class MilvusVectorStore:
                 logger.info(f"Processing batch {batch_num}/{total_batches}: {batch_count} tables")
 
                 # Generate embeddings for this batch
+                import json
                 texts = []
+                descriptions = []
+                field_descriptions_list = []
+
                 for table in batch_tables:
                     table_name = table.get('table_name', '')
+                    columns = table.get('columns', [])
 
-                    # Create semantic text for embedding (table name + description only)
-                    # Columns are stored separately in the 'schema' field
-                    text_parts = [f"Table: {table_name}"]
+                    # Extract field descriptions from columns
+                    field_descs = self._extract_field_descriptions(columns)
+                    field_descriptions_list.append(field_descs)
 
-                    # Use user-provided description if available, otherwise generate one
+                    # Get or generate table description
                     user_description = table.get('description')
                     if user_description:
-                        # Use user-provided description from MSSQL extended properties
-                        text_parts.append(f"Description: {user_description}")
+                        description = user_description
                         logger.debug(f"[DESC] {table_name}: Using user description: {user_description[:100]}")
                     else:
-                        # Fall back to auto-generated description from table name
-                        generated_desc = self._generate_semantic_description(table_name)
-                        text_parts.append(f"Description: {generated_desc}")
+                        description = self._generate_semantic_description(table_name)
                         logger.debug(f"[DESC] {table_name}: Using auto-generated description")
+
+                    descriptions.append(description)
+
+                    # Create semantic text for embedding: Table + Description + Field Descriptions
+                    text_parts = [f"Table: {table_name}"]
+                    text_parts.append(f"Description: {description}")
+
+                    # Add field descriptions if available
+                    if field_descs:
+                        field_desc_str = self._format_field_descriptions_for_embedding(field_descs)
+                        text_parts.append(f"Field Descriptions: {field_desc_str}")
 
                     text = "\n".join(text_parts)
                     texts.append(text)
@@ -232,14 +285,15 @@ class MilvusVectorStore:
                     for t in batch_tables
                 ]
 
-                # Prepare batch data - with schema
-                import json
+                # Prepare batch data - with new fields: description, field_descriptions, text, schema
                 batch_data = [
                     batch_ids,  # Deterministic IDs for updating records
                     [database_id] * batch_count,  # database_id for all tables in batch
-                    [t.get('table_name', '') for t in batch_tables],
-                    [text[:4096] for text in texts],  # Store the text used for embedding
-                    [json.dumps(t.get('columns', []))[:8192] for t in batch_tables],  # Schema as JSON
+                    [t.get('table_name', '') for t in batch_tables],  # table_name
+                    [desc[:4096] for desc in descriptions],  # description (separate field, 4KB)
+                    [json.dumps(fd)[:32768] for fd in field_descriptions_list],  # field_descriptions as JSON (32KB)
+                    [text[:16384] for text in texts],  # text (embedding input, 16KB)
+                    [json.dumps(t.get('columns', []))[:32768] for t in batch_tables],  # schema as JSON (32KB)
                     [False] * batch_count,  # needs_sync - always False after sync completion
                     [False] * batch_count,  # skipped - always False initially (UI can control)
                     embeddings.tolist()
@@ -325,10 +379,11 @@ class MilvusVectorStore:
                 param=search_params,
                 limit=k,
                 expr=f'database_id == "{database_id}" && skipped == false',  # Filter by database_id and exclude skipped tables
-                output_fields=["database_id", "table_name", "text", "schema"]
+                output_fields=["database_id", "table_name", "description", "field_descriptions", "text", "schema"]
             )
 
             # Format results
+            import json
             tables = []
             for hits in results:
                 for hit in hits:
@@ -336,20 +391,23 @@ class MilvusVectorStore:
                     distance = hit.distance
                     score = 1.0 / (1.0 + distance) if metric_type == "L2" else hit.distance
 
-                    # Parse schema JSON back to Python object
-                    import json
+                    # Parse JSON fields back to Python objects
                     # PyMilvus API: use dictionary-style access
                     try:
                         schema_json = hit.entity["schema"] if "schema" in hit.entity else "[]"
                         table_name = hit.entity["table_name"] if "table_name" in hit.entity else ""
                         database_id_val = hit.entity["database_id"] if "database_id" in hit.entity else ""
                         text = hit.entity["text"] if "text" in hit.entity else ""
+                        description = hit.entity["description"] if "description" in hit.entity else ""
+                        field_descriptions_json = hit.entity["field_descriptions"] if "field_descriptions" in hit.entity else "[]"
                     except (TypeError, KeyError):
                         # Fallback for older PyMilvus versions
                         schema_json = hit.entity.get("schema") or "[]"
                         table_name = hit.entity.get("table_name") or ""
                         database_id_val = hit.entity.get("database_id") or ""
                         text = hit.entity.get("text") or ""
+                        description = hit.entity.get("description") or ""
+                        field_descriptions_json = hit.entity.get("field_descriptions") or "[]"
 
                     try:
                         columns = json.loads(schema_json) if schema_json else []
@@ -357,9 +415,17 @@ class MilvusVectorStore:
                         logger.warning(f"Failed to parse schema JSON for table {table_name}")
                         columns = []
 
+                    try:
+                        field_descriptions = json.loads(field_descriptions_json) if field_descriptions_json else []
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse field_descriptions JSON for table {table_name}")
+                        field_descriptions = []
+
                     table = {
                         "database_id": database_id_val,
                         "table_name": table_name,
+                        "description": description,
+                        "field_descriptions": field_descriptions,
                         "text": text,
                         "columns": columns,  # Include parsed columns
                         "score": score,
@@ -439,25 +505,41 @@ class MilvusVectorStore:
                 batch_count = len(batch_tables)
 
                 # Generate embeddings for this batch
+                import json
                 texts = []
+                descriptions = []
+                field_descriptions_list = []
+
                 for table in batch_tables:
                     table_name = table.get('table_name', '')
+                    columns = table.get('columns', [])
 
-                    # Create semantic text for embedding (table name + description only)
-                    # Columns are stored separately in the 'schema' field
-                    text_parts = [f"Table: {table_name}"]
+                    # Get field descriptions - either from table metadata or parse from existing
+                    field_descs = table.get('field_descriptions')
+                    if field_descs is None:
+                        # Extract from columns if available
+                        field_descs = self._extract_field_descriptions(columns)
+                    field_descriptions_list.append(field_descs if field_descs else [])
 
-                    # Use user-provided description if available, otherwise generate one
+                    # Get or generate table description
                     user_description = table.get('description')
                     if user_description:
-                        # Use user-provided description from MSSQL extended properties
-                        text_parts.append(f"Description: {user_description}")
+                        description = user_description
                         logger.debug(f"[DESC] {table_name}: Using user description: {user_description[:100]}")
                     else:
-                        # Fall back to auto-generated description from table name
-                        generated_desc = self._generate_semantic_description(table_name)
-                        text_parts.append(f"Description: {generated_desc}")
+                        description = self._generate_semantic_description(table_name)
                         logger.debug(f"[DESC] {table_name}: Using auto-generated description")
+
+                    descriptions.append(description)
+
+                    # Create semantic text for embedding: Table + Description + Field Descriptions
+                    text_parts = [f"Table: {table_name}"]
+                    text_parts.append(f"Description: {description}")
+
+                    # Add field descriptions if available
+                    if field_descs:
+                        field_desc_str = self._format_field_descriptions_for_embedding(field_descs)
+                        text_parts.append(f"Field Descriptions: {field_desc_str}")
 
                     text = "\n".join(text_parts)
                     texts.append(text)
@@ -471,16 +553,17 @@ class MilvusVectorStore:
                     for t in batch_tables
                 ]
 
-                # Prepare batch data with needs_sync=False
-                import json
+                # Prepare batch data with new fields: description, field_descriptions, text, schema
                 batch_data = [
                     batch_ids,
                     [database_id] * batch_count,
-                    [t.get('table_name', '') for t in batch_tables],
-                    [text[:4096] for text in texts],
-                    [json.dumps(t.get('columns', []))[:8192] for t in batch_tables],  # Schema as JSON
+                    [t.get('table_name', '') for t in batch_tables],  # table_name
+                    [desc[:4096] for desc in descriptions],  # description (separate field, 4KB)
+                    [json.dumps(fd)[:32768] for fd in field_descriptions_list],  # field_descriptions as JSON (32KB)
+                    [text[:16384] for text in texts],  # text (embedding input, 16KB)
+                    [json.dumps(t.get('columns', []))[:32768] for t in batch_tables],  # schema as JSON (32KB)
                     [False] * batch_count,  # needs_sync - set to False after sync
-                    [False] * batch_count,  # skipped
+                    [t.get('skipped', False) for t in batch_tables],  # skipped - preserve existing value
                     embeddings.tolist()
                 ]
 
@@ -507,7 +590,7 @@ class MilvusVectorStore:
             database_id: MongoDB database ID
 
         Returns:
-            List of tables with needs_sync=True
+            List of tables with needs_sync=True, including description and field_descriptions
         """
         if not self.connected or not self.loaded:
             raise ConnectionError("Milvus not connected or collection not loaded")
@@ -518,7 +601,7 @@ class MilvusVectorStore:
 
             results = self.collection.query(
                 expr=expr,
-                output_fields=["database_id", "table_name", "text", "needs_sync"]
+                output_fields=["database_id", "table_name", "description", "field_descriptions", "text", "schema", "needs_sync", "skipped"]
             )
 
             logger.info(f"Found {len(results)} tables needing sync for database {database_id}")

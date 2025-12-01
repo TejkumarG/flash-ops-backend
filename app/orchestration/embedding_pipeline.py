@@ -67,31 +67,44 @@ class EmbeddingPipeline:
                 logger.info(f"INCREMENTAL SYNC: Found {len(tables_needing_sync)} tables with needs_sync=true")
                 logger.info(f"=" * 80)
 
-                # Use existing text from Milvus (edited in UI) - NO re-fetching from MSSQL
-                # Parse description from the text field
+                # Use existing data from Milvus (edited in UI) - NO re-fetching from MSSQL
+                # Now using separate description and field_descriptions fields
+                import json
                 tables_to_sync = []
                 for table_entry in tables_needing_sync:
                     table_name = table_entry['table_name']
-                    text = table_entry.get('text', '')
+                    description = table_entry.get('description', '')
+                    field_descriptions_json = table_entry.get('field_descriptions', '[]')
+                    schema_json = table_entry.get('schema', '[]')
+                    skipped = table_entry.get('skipped', False)
 
-                    # Extract description from text (format: "Table: name\nDescription: desc")
-                    description = None
-                    if '\nDescription: ' in text:
-                        # Split on newline and get the part after "Description: "
-                        parts = text.split('\nDescription: ', 1)
-                        if len(parts) > 1:
-                            description = parts[1].strip()
+                    # Parse field_descriptions from JSON
+                    try:
+                        field_descriptions = json.loads(field_descriptions_json) if field_descriptions_json else []
+                    except json.JSONDecodeError:
+                        field_descriptions = []
 
-                    # Create minimal table metadata (just name and description)
+                    # Parse columns from schema JSON
+                    try:
+                        columns = json.loads(schema_json) if schema_json else []
+                    except json.JSONDecodeError:
+                        columns = []
+
+                    # Create table metadata with all fields
                     table_metadata = {
                         'table_name': table_name,
-                        'description': description  # Will be None if not found, which is fine
+                        'description': description,
+                        'field_descriptions': field_descriptions,
+                        'columns': columns,
+                        'skipped': skipped
                     }
                     tables_to_sync.append(table_metadata)
 
-                    logger.info(f"  - {table_name}: {description[:80] if description else 'No description'}{'...' if description and len(description) > 80 else ''}")
+                    # Log field descriptions count
+                    field_desc_count = len(field_descriptions) if field_descriptions else 0
+                    logger.info(f"  - {table_name}: {description[:60] if description else 'No description'}{'...' if description and len(description) > 60 else ''} ({field_desc_count} field descriptions)")
 
-                logger.info(f"\nUsing existing text from Milvus for {len(tables_to_sync)} tables (no MSSQL re-fetch)")
+                logger.info(f"\nUsing existing data from Milvus for {len(tables_to_sync)} tables (no MSSQL re-fetch)")
 
                 # Write UI-edited descriptions to MSSQL for persistence
                 logger.info(f"\n{'=' * 80}")
@@ -110,18 +123,37 @@ class EmbeddingPipeline:
                     # Create schema extractor
                     extractor = SchemaExtractor(connection_config)
 
-                    # Write descriptions in batch
+                    # Write table descriptions in batch
+                    logger.info(f"Writing table descriptions...")
                     num_added, num_updated, errors = extractor.write_table_descriptions_batch(
                         database_name,
                         tables_to_sync
                     )
 
                     if errors:
-                        logger.warning(f"\n⚠ Some descriptions failed to write: {len(errors)} errors")
+                        logger.warning(f"\n⚠ Some table descriptions failed to write: {len(errors)} errors")
                         for error in errors:
                             logger.warning(f"  - {error}")
 
-                    logger.info(f"\n✓ MSSQL write complete: {num_added} added, {num_updated} updated, {len(errors)} errors")
+                    logger.info(f"✓ Table descriptions: {num_added} added, {num_updated} updated, {len(errors)} errors")
+
+                    # Write field descriptions in batch
+                    logger.info(f"Writing field descriptions...")
+                    field_num_added, field_num_updated, field_errors = extractor.write_field_descriptions_batch(
+                        database_name,
+                        tables_to_sync
+                    )
+
+                    if field_errors:
+                        logger.warning(f"\n⚠ Some field descriptions failed to write: {len(field_errors)} errors")
+                        for error in field_errors[:5]:  # Log first 5 errors
+                            logger.warning(f"  - {error}")
+                        if len(field_errors) > 5:
+                            logger.warning(f"  ... and {len(field_errors) - 5} more errors")
+
+                    logger.info(f"✓ Field descriptions: {field_num_added} added, {field_num_updated} updated, {len(field_errors)} errors")
+
+                    logger.info(f"\n✓ MSSQL write complete")
 
                     extractor.close()
 

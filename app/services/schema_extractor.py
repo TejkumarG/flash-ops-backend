@@ -802,6 +802,144 @@ class SchemaExtractor:
             logger.error(f"Error writing descriptions to MSSQL: {e}")
             raise
 
+    def write_field_descriptions_batch(
+        self,
+        database_name: str,
+        table_field_descriptions: List[Dict[str, Any]]
+    ) -> Tuple[int, int, List[str]]:
+        """
+        Write field/column descriptions to MSSQL extended properties in batch.
+
+        Args:
+            database_name: Database name
+            table_field_descriptions: List of dicts with 'table_name' and 'field_descriptions' keys
+                field_descriptions is a list of dicts with 'field_name' and 'description'
+
+        Returns:
+            Tuple of (num_added, num_updated, errors)
+        """
+        if self.connection_type != 'mssql':
+            raise NotImplementedError("Description writing only supported for MSSQL")
+
+        try:
+            # Decrypt password
+            encrypted_password = self.config.get('password', '')
+            password = decrypt_password(encrypted_password)
+
+            # Connect to MSSQL
+            logger.info(f"Connecting to MSSQL to write field descriptions...")
+            connection = pytds.connect(
+                server=self.config.get('host'),
+                port=self.config.get('port', 1433),
+                user=self.config.get('username'),
+                password=password,
+                database=database_name,
+                autocommit=True
+            )
+
+            cursor = connection.cursor()
+
+            # Collect all table-column pairs that have descriptions
+            field_writes = []
+            for td in table_field_descriptions:
+                table_name = td['table_name']
+                field_descs = td.get('field_descriptions', [])
+                if field_descs:
+                    for fd in field_descs:
+                        field_name = fd.get('field_name')
+                        description = fd.get('description')
+                        if field_name and description:
+                            field_writes.append({
+                                'table_name': table_name,
+                                'field_name': field_name,
+                                'description': description
+                            })
+
+            if not field_writes:
+                logger.info("No field descriptions to write")
+                cursor.close()
+                connection.close()
+                return 0, 0, []
+
+            logger.info(f"Writing {len(field_writes)} field descriptions...")
+
+            # Get existing column descriptions
+            table_names = list(set(fw['table_name'] for fw in field_writes))
+            placeholders = ','.join(['%s'] * len(table_names))
+            check_query = f"""
+                SELECT
+                    t.name AS table_name,
+                    c.name AS column_name
+                FROM sys.tables t
+                INNER JOIN sys.columns c ON c.object_id = t.object_id
+                INNER JOIN sys.extended_properties ep
+                    ON ep.major_id = t.object_id
+                    AND ep.minor_id = c.column_id
+                    AND ep.name = 'MS_Description'
+                WHERE t.name IN ({placeholders})
+            """
+
+            cursor.execute(check_query, tuple(table_names))
+            existing_columns = {(row[0], row[1]) for row in cursor.fetchall()}
+
+            logger.info(f"Found {len(existing_columns)} columns with existing descriptions")
+
+            num_added = 0
+            num_updated = 0
+            errors = []
+
+            # Write each field description
+            for fw in field_writes:
+                table_name = fw['table_name']
+                field_name = fw['field_name']
+                description = fw['description']
+
+                try:
+                    # Escape single quotes for SQL
+                    escaped_desc = description.replace("'", "''")
+
+                    if (table_name, field_name) in existing_columns:
+                        # Update existing
+                        logger.debug(f"[MSSQL WRITE] Updating MS_Description for {table_name}.{field_name}")
+                        query = f"""
+                            EXEC sp_updateextendedproperty
+                                @name = N'MS_Description',
+                                @value = N'{escaped_desc}',
+                                @level0type = N'SCHEMA', @level0name = 'dbo',
+                                @level1type = N'TABLE', @level1name = N'{table_name}',
+                                @level2type = N'COLUMN', @level2name = N'{field_name}'
+                        """
+                        cursor.execute(query)
+                        num_updated += 1
+                    else:
+                        # Add new
+                        logger.debug(f"[MSSQL WRITE] Adding MS_Description for {table_name}.{field_name}")
+                        query = f"""
+                            EXEC sp_addextendedproperty
+                                @name = N'MS_Description',
+                                @value = N'{escaped_desc}',
+                                @level0type = N'SCHEMA', @level0name = 'dbo',
+                                @level1type = N'TABLE', @level1name = N'{table_name}',
+                                @level2type = N'COLUMN', @level2name = N'{field_name}'
+                        """
+                        cursor.execute(query)
+                        num_added += 1
+
+                except Exception as e:
+                    error_msg = f"Failed to write description for {table_name}.{field_name}: {str(e)}"
+                    logger.error(f"[MSSQL WRITE] ✗ {error_msg}")
+                    errors.append(error_msg)
+
+            cursor.close()
+            connection.close()
+
+            logger.info(f"Field descriptions write complete: {num_added} added, {num_updated} updated, {len(errors)} errors")
+            return num_added, num_updated, errors
+
+        except Exception as e:
+            logger.error(f"Error writing field descriptions to MSSQL: {e}")
+            raise
+
     def close(self):
         """Close database connection."""
         if self.connection:
